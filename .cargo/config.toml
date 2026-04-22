@@ -1,0 +1,11 @@
+[env]
+LIBCLANG_PATH = "/usr/lib64"
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/gcc/x86_64-redhat-linux/8/include -I/usr/include"
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

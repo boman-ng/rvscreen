@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang musl-tools
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build musl static binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/usr/include"
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/rvscreen
+          ldd target/x86_64-unknown-linux-musl/release/rvscreen || true
+          ./target/x86_64-unknown-linux-musl/release/rvscreen --help
