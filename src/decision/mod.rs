@@ -8,5 +8,7 @@ pub use negative_control::{
     apply_negative_control, BackgroundComparator, NegativeControlDecisionInput,
     NegativeControlResult,
 };
-pub use release_gate::{load_benchmark_gates, ReleaseContext, ReleaseGate};
+pub use release_gate::{
+    expected_release_status, load_benchmark_gates, ReleaseContext, ReleaseGate,
+};
 pub use stats::{ProportionEstimate, SAMPLING_ONLY_CI_LABEL};

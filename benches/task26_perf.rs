@@ -2,10 +2,11 @@ use criterion::{black_box, BenchmarkId, Criterion, Throughput};
 use rayon::prelude::*;
 use rvscreen::align::{CompetitiveAligner, CompetitivePreset, FragmentAlignResult};
 use rvscreen::io::{FastqPairReader, FragmentRecord};
-use rvscreen::pipeline::run_screen;
+use rvscreen::pipeline::{run_screen, PreparedScreenRunner};
 use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
 use rvscreen::types::{BundleManifest, ContigEntry};
 use rvscreen::{cli::ScreenArgs, cli::ScreenMode};
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,21 +25,26 @@ use testutil::{
 const IO_FRAGMENT_COUNT: usize = 32_000;
 const ALIGN_FRAGMENT_COUNT: usize = 4_096;
 const E2E_FRAGMENT_COUNT: usize = 10_000;
-const SUMMARY_REPEATS: usize = 5;
-const E2E_SUMMARY_REPEATS: usize = 3;
-const THREAD_CURVE: [usize; 4] = [1, 2, 4, 8];
-const E2E_THREADS: [usize; 2] = [1, 4];
+const DEFAULT_SUMMARY_REPEATS: usize = 5;
+const DEFAULT_E2E_SUMMARY_REPEATS: usize = 3;
+const CI_SUMMARY_REPEATS: usize = 3;
+const CI_E2E_SUMMARY_REPEATS: usize = 2;
+const DEFAULT_THREAD_CURVE: [usize; 4] = [1, 2, 4, 8];
+const CI_THREAD_CURVE: [usize; 2] = [1, 4];
+const DEFAULT_E2E_THREADS: [usize; 2] = [1, 4];
 const SUMMARY_PATH: &str = "target/criterion/task26_summary.tsv";
+const MAX_THREAD_BUDGET: usize = 16;
 
 fn main() {
     real_main().expect("Task 26 benchmark suite should succeed");
 }
 
 fn real_main() -> io::Result<()> {
+    let settings = BenchSettings::from_env();
     let mut criterion = Criterion::default()
-        .sample_size(10)
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(2))
+        .sample_size(settings.sample_size)
+        .warm_up_time(settings.warm_up_time)
+        .measurement_time(settings.measurement_time)
         .configure_from_args();
 
     let io_fixture = BenchmarkFixture::new(IO_FRAGMENT_COUNT, 2601)?;
@@ -47,16 +53,22 @@ fn real_main() -> io::Result<()> {
     let alignment_fragments = alignment_fixture.load_fragments()?;
 
     benchmark_fastq_input(&mut criterion, &io_fixture);
-    benchmark_alignment(&mut criterion, &alignment_fixture, &alignment_fragments);
-    benchmark_end_to_end(&mut criterion, &e2e_fixture);
+    benchmark_alignment(
+        &mut criterion,
+        &alignment_fixture,
+        &alignment_fragments,
+        &settings,
+    );
+    benchmark_end_to_end(&mut criterion, &e2e_fixture, &settings);
 
     let summary_rows = collect_summary(
         &io_fixture,
         &alignment_fixture,
         &alignment_fragments,
         &e2e_fixture,
+        &settings,
     )?;
-    write_summary(&summary_rows)?;
+    write_summary(&summary_rows, &settings.summary_path)?;
 
     criterion.final_summary();
     Ok(())
@@ -79,11 +91,12 @@ fn benchmark_alignment(
     criterion: &mut Criterion,
     fixture: &BenchmarkFixture,
     fragments: &[FragmentRecord],
+    settings: &BenchSettings,
 ) {
     let mut group = criterion.benchmark_group("task26_alignment_throughput");
     group.throughput(Throughput::Elements(fragments.len() as u64));
 
-    for threads in THREAD_CURVE {
+    for &threads in &settings.alignment_threads {
         let aligner = fixture
             .competitive_aligner(threads)
             .expect("alignment benchmark aligner should build");
@@ -105,13 +118,13 @@ fn benchmark_alignment(
     group.finish();
 }
 
-fn benchmark_end_to_end(criterion: &mut Criterion, fixture: &BenchmarkFixture) {
+fn benchmark_end_to_end(criterion: &mut Criterion, fixture: &BenchmarkFixture, settings: &BenchSettings) {
     let mut group = criterion.benchmark_group("task26_end_to_end_latency");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(settings.sample_size);
+    group.measurement_time(settings.end_to_end_measurement_time);
     group.throughput(Throughput::Elements(fixture.fragment_count as u64));
 
-    for threads in E2E_THREADS {
+    for &threads in &settings.end_to_end_threads {
         group.bench_with_input(
             BenchmarkId::from_parameter(threads),
             &threads,
@@ -132,6 +145,29 @@ fn benchmark_end_to_end(criterion: &mut Criterion, fixture: &BenchmarkFixture) {
     }
 
     group.finish();
+
+    let mut cold_group = criterion.benchmark_group("task26_prepare_cold_start");
+    cold_group.sample_size(settings.sample_size);
+    cold_group.measurement_time(settings.end_to_end_measurement_time);
+
+    for &threads in &settings.end_to_end_threads {
+        cold_group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |bencher, &threads| {
+                bencher.iter(|| {
+                    let output_dir = fixture.output_dir("criterion-prepare", threads);
+                    let args = fixture.screen_args(threads, output_dir.clone());
+                    let prepared = PreparedScreenRunner::prepare(&args)
+                        .expect("prepare cold-start benchmark should succeed");
+                    black_box(prepared.aligner_reference_input().to_path_buf());
+                    fs::remove_dir_all(output_dir).ok();
+                });
+            },
+        );
+    }
+
+    cold_group.finish();
 }
 
 fn collect_summary(
@@ -139,34 +175,48 @@ fn collect_summary(
     alignment_fixture: &BenchmarkFixture,
     alignment_fragments: &[FragmentRecord],
     e2e_fixture: &BenchmarkFixture,
+    settings: &BenchSettings,
 ) -> io::Result<Vec<SummaryRow>> {
     let mut rows = Vec::new();
     rows.push(measure_pairs_per_second(
         "input_throughput",
         "fastq_pair_read",
         1,
-        SUMMARY_REPEATS,
+        settings.summary_repeats,
         || count_fastq_pairs(&io_fixture.r1, &io_fixture.r2).map(|value| value as u64),
     )?);
 
-    for threads in THREAD_CURVE {
+    for &threads in &settings.alignment_threads {
         let aligner = alignment_fixture.competitive_aligner(threads)?;
         let thread_pool = thread_pool_for(threads)?;
         rows.push(measure_pairs_per_second(
             "alignment_throughput",
             "competitive_align",
             threads,
-            SUMMARY_REPEATS,
+            settings.summary_repeats,
             || align_all_fragments(alignment_fragments, &aligner, thread_pool.as_ref()),
+        )?);
+
+        rows.push(measure_latency_ms(
+            "startup_latency",
+            "competitive_aligner_prepare",
+            threads,
+            settings.summary_repeats,
+            || {
+                let started = Instant::now();
+                let aligner = alignment_fixture.competitive_aligner(threads)?;
+                black_box(aligner.uses_prebuilt_index());
+                Ok(started.elapsed())
+            },
         )?);
     }
 
-    for threads in E2E_THREADS {
+    for &threads in &settings.end_to_end_threads {
         rows.push(measure_latency_ms(
             "end_to_end_latency",
             "screen_to_report_bundle",
             threads,
-            E2E_SUMMARY_REPEATS,
+            settings.end_to_end_summary_repeats,
             || {
                 let output_dir = e2e_fixture.output_dir("summary-e2e", threads);
                 let started = Instant::now();
@@ -180,14 +230,55 @@ fn collect_summary(
                 Ok(started.elapsed())
             },
         )?);
+
+        rows.push(measure_latency_ms(
+            "startup_latency",
+            "screen_prepare_only",
+            threads,
+            settings.end_to_end_summary_repeats,
+            || {
+                let output_dir = e2e_fixture.output_dir("summary-prepare", threads);
+                let args = e2e_fixture.screen_args(threads, output_dir.clone());
+                let started = Instant::now();
+                let prepared = PreparedScreenRunner::prepare(&args).map_err(io_other)?;
+                black_box(prepared.aligner_uses_prebuilt_index());
+                fs::remove_dir_all(output_dir).ok();
+                Ok(started.elapsed())
+            },
+        )?);
+
+        rows.push(measure_latency_ms(
+            "end_to_end_latency",
+            "prepared_runner_execute_only",
+            threads,
+            settings.end_to_end_summary_repeats,
+            || {
+                let prepare_output_dir = e2e_fixture.output_dir("summary-prepared", threads);
+                let execute_output_dir = e2e_fixture.output_dir("summary-prepared-run", threads);
+                let args = e2e_fixture.screen_args(threads, prepare_output_dir.clone());
+                let prepared = PreparedScreenRunner::prepare(&args).map_err(io_other)?;
+                let mut execute_args = args.clone();
+                execute_args.out = execute_output_dir.clone();
+                let started = Instant::now();
+                let outcome = prepared.run_without_report(&execute_args).map_err(io_other)?;
+                assert_eq!(
+                    outcome.summary.sampled_fragments,
+                    e2e_fixture.fragment_count as u64
+                );
+                fs::remove_dir_all(prepare_output_dir).ok();
+                fs::remove_dir_all(execute_output_dir).ok();
+                Ok(started.elapsed())
+            },
+        )?);
     }
 
+    let peak_rss_kb = current_peak_rss_kb()?;
     rows.push(SummaryRow {
         metric: "peak_rss",
         scenario: "cargo_bench_process_hwm".to_string(),
         threads: "-".to_string(),
         repeats: 1,
-        mean: current_peak_rss_kb()? as f64,
+        mean: peak_rss_kb as f64,
         unit: "KiB",
         cv_pct: 0.0,
     });
@@ -208,9 +299,9 @@ where
     let mut samples = Vec::with_capacity(repeats);
     for _ in 0..repeats {
         let started = Instant::now();
-        let processed = run()? as f64;
+        let processed_pairs = run()?;
         let elapsed = started.elapsed().as_secs_f64();
-        samples.push(processed / elapsed.max(f64::MIN_POSITIVE));
+        samples.push(processed_pairs as f64 / elapsed.max(f64::MIN_POSITIVE));
     }
 
     Ok(SummaryRow {
@@ -311,8 +402,10 @@ fn thread_pool_for(threads: usize) -> io::Result<Option<rayon::ThreadPool>> {
         .map_err(io_other)
 }
 
-fn write_summary(rows: &[SummaryRow]) -> io::Result<()> {
-    fs::create_dir_all("target/criterion")?;
+fn write_summary(rows: &[SummaryRow], path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut body = String::from("metric\tscenario\tthreads\trepeats\tmean\tunit\tcv_pct\n");
     for row in rows {
         body.push_str(&format!(
@@ -320,7 +413,7 @@ fn write_summary(rows: &[SummaryRow]) -> io::Result<()> {
             row.metric, row.scenario, row.threads, row.repeats, row.mean, row.unit, row.cv_pct
         ));
     }
-    fs::write(SUMMARY_PATH, body)
+    fs::write(path, body)
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -369,6 +462,66 @@ struct SummaryRow {
     mean: f64,
     unit: &'static str,
     cv_pct: f64,
+}
+
+struct BenchSettings {
+    alignment_threads: Vec<usize>,
+    end_to_end_threads: Vec<usize>,
+    summary_repeats: usize,
+    end_to_end_summary_repeats: usize,
+    sample_size: usize,
+    warm_up_time: Duration,
+    measurement_time: Duration,
+    end_to_end_measurement_time: Duration,
+    summary_path: PathBuf,
+}
+
+impl BenchSettings {
+    fn from_env() -> Self {
+        let ci = ci_mode();
+        Self {
+            alignment_threads: parse_thread_list(
+                "RVSCREEN_TASK26_ALIGNMENT_THREADS",
+                if ci {
+                    &CI_THREAD_CURVE[..]
+                } else {
+                    &DEFAULT_THREAD_CURVE[..]
+                },
+            ),
+            end_to_end_threads: parse_thread_list(
+                "RVSCREEN_TASK26_E2E_THREADS",
+                &DEFAULT_E2E_THREADS[..],
+            ),
+            summary_repeats: env::var("RVSCREEN_TASK26_SUMMARY_REPEATS")
+                .ok()
+                .map(|value| parse_positive_usize(&value, "RVSCREEN_TASK26_SUMMARY_REPEATS"))
+                .unwrap_or(if ci {
+                    CI_SUMMARY_REPEATS
+                } else {
+                    DEFAULT_SUMMARY_REPEATS
+                }),
+            end_to_end_summary_repeats: env::var("RVSCREEN_TASK26_E2E_SUMMARY_REPEATS")
+                .ok()
+                .map(|value| {
+                    parse_positive_usize(&value, "RVSCREEN_TASK26_E2E_SUMMARY_REPEATS")
+                })
+                .unwrap_or(if ci {
+                    CI_E2E_SUMMARY_REPEATS
+                } else {
+                    DEFAULT_E2E_SUMMARY_REPEATS
+                }),
+            sample_size: env::var("RVSCREEN_TASK26_SAMPLE_SIZE")
+                .ok()
+                .map(|value| parse_positive_usize(&value, "RVSCREEN_TASK26_SAMPLE_SIZE"))
+                .unwrap_or(10),
+            warm_up_time: Duration::from_secs(1),
+            measurement_time: Duration::from_secs(if ci { 1 } else { 2 }),
+            end_to_end_measurement_time: Duration::from_secs(if ci { 1 } else { 3 }),
+            summary_path: env::var_os("RVSCREEN_TASK26_SUMMARY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(SUMMARY_PATH)),
+        }
+    }
 }
 
 struct BenchmarkFixture {
@@ -443,7 +596,6 @@ impl BenchmarkFixture {
             threads,
         }
     }
-
     fn output_dir(&self, prefix: &str, threads: usize) -> PathBuf {
         self.base_dir
             .join(format!("{prefix}-{threads}-{}", unique_run_id()))
@@ -574,6 +726,64 @@ fn write_taxonomy(path: &Path, entries: &[ContigEntry]) -> io::Result<()> {
 
 fn io_other(error: impl ToString) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+fn parse_thread_list(name: &str, default: &[usize]) -> Vec<usize> {
+    let threads = env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| parse_positive_usize(value, name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| default.to_vec());
+
+    if threads.is_empty() {
+        panic!("{name} must contain at least one thread count");
+    }
+
+    let max_threads = max_thread_budget();
+    for thread in &threads {
+        assert!(
+            *thread <= max_threads,
+            "{name} cannot exceed the {max_threads}-thread repo budget"
+        );
+    }
+    threads
+}
+
+fn max_thread_budget() -> usize {
+    env::var("RVSCREEN_BENCH_MAX_THREADS")
+        .ok()
+        .map(|value| parse_positive_usize(&value, "RVSCREEN_BENCH_MAX_THREADS"))
+        .map(|value| {
+            assert!(
+                value <= MAX_THREAD_BUDGET,
+                "RVSCREEN_BENCH_MAX_THREADS cannot exceed {MAX_THREAD_BUDGET}"
+            );
+            value
+        })
+        .unwrap_or(MAX_THREAD_BUDGET)
+}
+
+fn parse_positive_usize(value: &str, name: &str) -> usize {
+    let parsed = value
+        .parse::<usize>()
+        .unwrap_or_else(|error| panic!("{name} must be an integer: {error}"));
+    assert!(parsed > 0, "{name} must be greater than zero");
+    parsed
+}
+
+fn ci_mode() -> bool {
+    env::var("RVSCREEN_BENCH_CI")
+        .map(|value| {
+            let normalized = value.trim();
+            !normalized.is_empty() && normalized != "0" && !normalized.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 fn unique_run_id() -> u128 {

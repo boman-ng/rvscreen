@@ -610,7 +610,7 @@ fn build_release_gate(
         }
     };
 
-    let reference_failures = benchmark_runs
+    let non_final_runs = benchmark_runs
         .iter()
         .filter(|run| {
             matches!(
@@ -631,14 +631,14 @@ fn build_release_gate(
         details: BACKEND_GATE_DETAILS.to_string(),
     };
 
-    let reference_gate = if reference_failures == 0 {
+    let reference_gate = if non_final_runs == 0 {
         reference_gate
     } else {
         ReferenceGate {
             status: GateStatus::Pass,
             details: format!(
-                "All {} benchmark runs were bound to reference bundle `{reference_bundle_version}`; run release_status values remained provisional as expected without negative controls",
-                benchmark_runs.len()
+                "All {} benchmark runs were bound to reference bundle `{reference_bundle_version}`; {non_final_runs} run(s) remained non-final (`provisional` or `blocked`) as expected because calibration benchmark executions do not provide qualified negative-control release evidence",
+                benchmark_runs.len(),
             ),
         }
     };

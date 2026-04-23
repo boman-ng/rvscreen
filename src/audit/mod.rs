@@ -1,21 +1,20 @@
 use crate::calibration::{load_profile, load_reference_bundle};
 use crate::cli::AuditVerifyArgs;
-use crate::decision::SAMPLING_ONLY_CI_LABEL;
+use crate::decision::{expected_release_status, NegativeControlDecisionInput, NegativeControlResult};
 use crate::error::{Result, RvScreenError};
-use crate::types::{ProfileToml, ReleaseStatus, RoundRecord, RunManifest, SampleSummary};
+use crate::report::contract::{
+    sampling_only_ci_label_violation, CANDIDATE_CALLS_TSV, CHECKSUM_SHA256,
+    REQUIRED_REPORT_BUNDLE_FILES, ROUNDS_TSV, RUN_MANIFEST_JSON, SAMPLE_SUMMARY_JSON,
+};
+use crate::types::{
+    NegativeControlStatus, ProfileToml, ReleaseStatus, RoundRecord, RunManifest, SampleSummary,
+};
 use csv::ReaderBuilder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
-
-const SAMPLE_SUMMARY_JSON: &str = "sample_summary.json";
-const CANDIDATE_CALLS_TSV: &str = "candidate_calls.tsv";
-const RUN_MANIFEST_JSON: &str = "run_manifest.json";
-const ROUNDS_TSV: &str = "rounds.tsv";
-const CHECKSUM_SHA256: &str = "checksum.sha256";
-const FRACTION_CI_REASON_PREFIX: &str = "fraction_ci_95_label=";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditVerifyReport {
@@ -54,13 +53,7 @@ struct CandidateCiRecord {
 pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
     let mut report = AuditVerifyReport::new(args.report_bundle.clone());
 
-    let required_files = [
-        SAMPLE_SUMMARY_JSON,
-        CANDIDATE_CALLS_TSV,
-        RUN_MANIFEST_JSON,
-        ROUNDS_TSV,
-    ];
-    let missing_files = required_files
+    let missing_files = REQUIRED_REPORT_BUNDLE_FILES
         .iter()
         .filter(|name| !args.report_bundle.join(name).is_file())
         .copied()
@@ -68,7 +61,10 @@ pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
     if missing_files.is_empty() {
         report.pass(
             "report bundle completeness",
-            format!("found required files: {}", required_files.join(", ")),
+            format!(
+                "found required files: {}",
+                REQUIRED_REPORT_BUNDLE_FILES.join(", ")
+            ),
         );
     } else {
         report.fail(
@@ -179,7 +175,13 @@ pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
         None
     };
 
-    verify_release_status(summary.as_ref(), loaded_profile.as_ref(), &mut report);
+    verify_release_status(
+        summary.as_ref(),
+        manifest.as_ref(),
+        loaded_profile.as_ref(),
+        args.calibration_profile.as_ref(),
+        &mut report,
+    );
 
     Ok(report)
 }
@@ -536,21 +538,9 @@ fn verify_candidate_ci_labels(candidates: &[CandidateCiRecord], report: &mut Aud
                     candidate.fraction_ci_95[1]
                 ));
             }
-            let observed = candidate
-                .decision_reasons
-                .iter()
-                .find_map(|reason| reason.strip_prefix(FRACTION_CI_REASON_PREFIX));
-            match observed {
-                Some(label) if label == SAMPLING_ONLY_CI_LABEL => None,
-                Some(label) => Some(format!(
-                    "candidate `{}` carries non-sampling-only label `{label}`",
-                    candidate.accession_or_group
-                )),
-                None => Some(format!(
-                    "candidate `{}` is missing `{FRACTION_CI_REASON_PREFIX}{SAMPLING_ONLY_CI_LABEL}`",
-                    candidate.accession_or_group
-                )),
-            }
+            sampling_only_ci_label_violation(&candidate.decision_reasons).map(|violation| {
+                format!("candidate `{}` {violation}", candidate.accession_or_group)
+            })
         })
         .collect::<Vec<_>>();
 
@@ -717,7 +707,9 @@ fn verify_calibration_profile_binding(
 
 fn verify_release_status(
     summary: Option<&SampleSummary>,
+    manifest: Option<&RunManifest>,
     profile: Option<&ProfileToml>,
+    calibration_profile_dir: Option<&PathBuf>,
     report: &mut AuditVerifyReport,
 ) {
     let Some(summary) = summary else {
@@ -735,44 +727,137 @@ fn verify_release_status(
         return;
     };
 
-    let release_status = &summary.release_status;
-    let sampling_mode = profile.sampling.mode.as_str();
-    let mut violations = Vec::new();
+    let Some(manifest) = manifest else {
+        report.skip(
+            "release_status compliance",
+            "skipped because run_manifest.json did not parse",
+        );
+        return;
+    };
 
-    match sampling_mode {
-        "representative" => {
-            if profile.negative_control_required && *release_status == ReleaseStatus::Provisional {
-                violations.push(
-                    "release_status `provisional` is impossible for representative mode when negative_control_required=true under current task rules"
-                        .to_string(),
-                );
-            }
-        }
-        "streaming" => {
-            if *release_status == ReleaseStatus::Final {
-                violations.push(
-                    "release_status `final` is not allowed for streaming mode under current task rules"
-                        .to_string(),
-                );
-            }
-        }
-        other => violations.push(format!(
-            "unsupported calibration sampling mode `{other}` in loaded profile"
-        )),
-    }
+    let Some(calibration_profile_dir) = calibration_profile_dir else {
+        report.skip(
+            "release_status compliance",
+            "skipped because --calibration-profile was not provided or did not load",
+        );
+        return;
+    };
 
-    if violations.is_empty() {
-        report.pass(
+    if manifest.sampling_mode != profile.sampling.mode {
+        report.fail(
             "release_status compliance",
             format!(
-                "no inferable release_status violations for mode `{}` / negative_control_required={} / release_status `{}`",
-                profile.sampling.mode,
-                profile.negative_control_required,
-                release_status_label(release_status)
+                "run_manifest sampling_mode `{}` does not match calibration profile sampling mode `{}`",
+                manifest.sampling_mode, profile.sampling.mode
+            ),
+        );
+        return;
+    }
+
+    if manifest.negative_control.required != profile.negative_control_required {
+        report.fail(
+            "release_status compliance",
+            format!(
+                "run_manifest negative_control.required `{}` does not match calibration profile negative_control_required `{}`",
+                manifest.negative_control.required, profile.negative_control_required
+            ),
+        );
+        return;
+    }
+
+    let benchmark_gates = match crate::decision::load_benchmark_gates(calibration_profile_dir) {
+        Ok(gates) => gates,
+        Err(error) => {
+            report.fail(
+                "release_status compliance",
+                format!("failed to load calibration release_gate.json: {error}"),
+            );
+            return;
+        }
+    };
+
+    let negative_control = negative_control_from_manifest(&manifest.negative_control);
+    let expected = match expected_release_status(
+        &manifest.sampling_mode,
+        manifest.negative_control.required,
+        &negative_control,
+        benchmark_gates.as_ref(),
+        &profile.status,
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            report.fail("release_status compliance", error.to_string());
+            return;
+        }
+    };
+
+    if summary.release_status != expected {
+        report.fail(
+            "release_status compliance",
+            format!(
+                "sample_summary release_status `{}` does not match recomputed release_status `{}` for sampling_mode `{}` / negative_control_status `{}` / negative_control_required={} / profile_status `{}`",
+                release_status_label(&summary.release_status),
+                release_status_label(&expected),
+                manifest.sampling_mode,
+                negative_control_status_label(&manifest.negative_control.status),
+                manifest.negative_control.required,
+                profile.status,
             ),
         );
     } else {
-        report.fail("release_status compliance", violations.join("; "));
+        report.pass(
+            "release_status compliance",
+            format!(
+                "sample_summary release_status `{}` matches recomputed release gate for sampling_mode `{}` / negative_control_status `{}` / negative_control_required={} / profile_status `{}`",
+                release_status_label(&summary.release_status),
+                manifest.sampling_mode,
+                negative_control_status_label(&manifest.negative_control.status),
+                manifest.negative_control.required,
+                profile.status,
+            ),
+        );
+    }
+}
+
+fn negative_control_from_manifest(
+    manifest: &crate::types::NegativeControlManifest,
+) -> NegativeControlDecisionInput {
+    match manifest.status {
+        NegativeControlStatus::Missing => NegativeControlDecisionInput::Missing,
+        NegativeControlStatus::Pass => NegativeControlDecisionInput::Passed {
+            comparator: crate::decision::BackgroundComparator::new(&NegativeControlResult {
+                control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                control_status: manifest
+                    .control_status
+                    .clone()
+                    .unwrap_or_else(|| "pass".to_string()),
+                candidates: Vec::new(),
+            }),
+            result: NegativeControlResult {
+                control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                control_status: manifest
+                    .control_status
+                    .clone()
+                    .unwrap_or_else(|| "pass".to_string()),
+                candidates: Vec::new(),
+            },
+        },
+        NegativeControlStatus::Fail => NegativeControlDecisionInput::Failed(NegativeControlResult {
+            control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
+            control_status: manifest
+                .control_status
+                .clone()
+                .unwrap_or_else(|| "fail".to_string()),
+            candidates: Vec::new(),
+        }),
+    }
+}
+
+fn negative_control_status_label(status: &NegativeControlStatus) -> &'static str {
+    match status {
+        NegativeControlStatus::Missing => "missing",
+        NegativeControlStatus::Pass => "pass",
+        NegativeControlStatus::Fail => "fail",
     }
 }
 
@@ -806,9 +891,12 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::SAMPLING_ONLY_CI_LABEL;
     use crate::report::ReportWriter;
+    use crate::report::contract::FRACTION_CI_REASON_PREFIX;
     use crate::types::{
-        CandidateCall, DecisionStatus, EvidenceStrength, ProfileToml, SamplingConfig, StopReason,
+        CandidateCall, DecisionStatus, EvidenceStrength, NegativeControlManifest,
+        NegativeControlStatus, ProfileToml, SamplingConfig, StopReason,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -886,6 +974,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_fraction_ci_labels_fail_audit() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+
+        let mut candidate_rows = candidate_fixtures();
+        candidate_rows[0]
+            .decision_reasons
+            .push(format!("fraction_ci_95_label={}", crate::decision::SAMPLING_ONLY_CI_LABEL));
+        ReportWriter::write(
+            &fixture.report_dir,
+            &sample_summary_fixture("rvscreen_ref_2026.04.21-r1"),
+            &candidate_rows,
+            &round_fixtures(),
+            &run_manifest_fixture("rvscreen_ref_2026.04.21-r1"),
+        )
+        .expect_err("writer should reject duplicate CI markers before audit");
+    }
+
+    #[test]
+    fn streaming_final_release_status_fails_audit() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+        write_profile_dir_with_mode_and_negative_control(&fixture.profile_dir, "rvscreen_ref_2026.04.21-r1", "streaming", false);
+        write_run_manifest_with_negative_control(&fixture.report_dir, |manifest| {
+            manifest.sampling_mode = "streaming".to_string();
+        });
+        write_sample_summary_with_release_status(&fixture.report_dir, ReleaseStatus::Final);
+
+        let report = run_audit_verify(&AuditVerifyArgs {
+            report_bundle: fixture.report_dir,
+            reference_bundle: Some(fixture.reference_dir),
+            calibration_profile: Some(fixture.profile_dir),
+        })
+        .expect("audit verify should run");
+
+        assert!(!report.passed(), "audit should fail");
+        assert!(
+            report
+                .render()
+                .contains("sample_summary release_status `final` does not match recomputed release_status `provisional`")
+                && report.render().contains("sampling_mode `streaming`"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn representative_required_negative_control_cannot_be_provisional() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+        write_profile_dir_with_mode_and_negative_control(&fixture.profile_dir, "rvscreen_ref_2026.04.21-r1", "representative", true);
+        write_run_manifest_with_negative_control(&fixture.report_dir, |manifest| {
+            manifest.negative_control.required = true;
+        });
+        write_sample_summary_with_release_status(&fixture.report_dir, ReleaseStatus::Provisional);
+
+        let report = run_audit_verify(&AuditVerifyArgs {
+            report_bundle: fixture.report_dir,
+            reference_bundle: Some(fixture.reference_dir),
+            calibration_profile: Some(fixture.profile_dir),
+        })
+        .expect("audit verify should run");
+
+        assert!(!report.passed(), "audit should fail");
+        assert!(
+            report
+                .render()
+                .contains("does not match recomputed release_status `final`"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn missing_checksum_file_fails_audit() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+        fs::remove_file(fixture.report_dir.join(CHECKSUM_SHA256))
+            .expect("checksum.sha256 should be removed");
+
+        let report = run_audit_verify(&AuditVerifyArgs {
+            report_bundle: fixture.report_dir,
+            reference_bundle: Some(fixture.reference_dir),
+            calibration_profile: Some(fixture.profile_dir),
+        })
+        .expect("audit verify should run");
+
+        assert!(!report.passed(), "audit should fail");
+        assert!(
+            report
+                .render()
+                .contains("missing required file(s): checksum.sha256"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn representative_required_negative_control_missing_is_blocked() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+        write_profile_dir_with_mode_and_negative_control(
+            &fixture.profile_dir,
+            "rvscreen_ref_2026.04.21-r1",
+            "representative",
+            true,
+        );
+        write_run_manifest_with_negative_control(&fixture.report_dir, |manifest| {
+            manifest.negative_control.required = true;
+            manifest.negative_control.status = NegativeControlStatus::Missing;
+            manifest.negative_control.control_id = None;
+            manifest.negative_control.control_status = None;
+        });
+        write_sample_summary_with_release_status(&fixture.report_dir, ReleaseStatus::Final);
+
+        let report = run_audit_verify(&AuditVerifyArgs {
+            report_bundle: fixture.report_dir,
+            reference_bundle: Some(fixture.reference_dir),
+            calibration_profile: Some(fixture.profile_dir),
+        })
+        .expect("audit verify should run");
+
+        assert!(!report.passed(), "audit should fail");
+        assert!(
+            report
+                .render()
+                .contains("does not match recomputed release_status `blocked`"),
+            "{}",
+            report.render()
+        );
+    }
+
     struct AuditFixture {
         report_dir: PathBuf,
         reference_dir: PathBuf,
@@ -928,6 +1149,20 @@ mod tests {
     }
 
     fn write_profile_dir(dir: &Path, reference_version: &str) {
+        write_profile_dir_with_mode_and_negative_control(
+            dir,
+            reference_version,
+            "representative",
+            false,
+        );
+    }
+
+    fn write_profile_dir_with_mode_and_negative_control(
+        dir: &Path,
+        reference_version: &str,
+        sampling_mode: &str,
+        negative_control_required: bool,
+    ) {
         fs::create_dir_all(dir).expect("profile dir should exist");
         let profile = ProfileToml {
             profile_id: "rvscreen_calib_2026.04.21-r1".to_string(),
@@ -938,9 +1173,9 @@ mod tests {
             seed: 20_260_421,
             supported_input: vec!["fastq".to_string(), "fastq.gz".to_string()],
             supported_read_type: vec!["illumina_pe_shortread".to_string()],
-            negative_control_required: false,
+            negative_control_required,
             sampling: SamplingConfig {
-                mode: "representative".to_string(),
+                mode: sampling_mode.to_string(),
                 rounds: vec![50_000, 100_000],
                 max_rounds: 2,
             },
@@ -966,6 +1201,84 @@ mod tests {
             toml::to_string_pretty(&profile).expect("profile.toml should serialize"),
         )
         .expect("profile.toml should be written");
+        fs::write(
+            dir.join("release_gate.json"),
+            serde_json::to_vec_pretty(&crate::calibration::ReleaseGate {
+                backend_gate: crate::calibration::BackendGate {
+                    status: crate::calibration::GateStatus::Pass,
+                    details: "audit fixture backend gate".to_string(),
+                },
+                reference_gate: crate::calibration::ReferenceGate {
+                    status: crate::calibration::GateStatus::Pass,
+                    details: "audit fixture reference gate".to_string(),
+                },
+                specificity_gate: crate::calibration::SpecificityGate {
+                    status: crate::calibration::GateStatus::Pass,
+                    details: "audit fixture specificity gate".to_string(),
+                    negative_samples: 1,
+                    false_positives: 0,
+                },
+                sensitivity_gate: crate::calibration::SensitivityGate {
+                    status: crate::calibration::GateStatus::Pass,
+                    details: "audit fixture sensitivity gate".to_string(),
+                    spike_in_detected: 1,
+                    spike_in_total: 1,
+                },
+            })
+            .expect("release_gate.json should serialize"),
+        )
+        .expect("release_gate.json should be written");
+    }
+
+    fn write_sample_summary_with_release_status(report_dir: &Path, release_status: ReleaseStatus) {
+        let mut summary = sample_summary_fixture("rvscreen_ref_2026.04.21-r1");
+        summary.release_status = release_status;
+        fs::write(
+            report_dir.join(SAMPLE_SUMMARY_JSON),
+            serde_json::to_vec_pretty(&summary).expect("sample summary should serialize"),
+        )
+        .expect("sample_summary.json should be rewritten");
+        refresh_report_checksum(report_dir);
+    }
+
+    fn write_run_manifest_with_negative_control(
+        report_dir: &Path,
+        mutate: impl FnOnce(&mut RunManifest),
+    ) {
+        let manifest_path = report_dir.join(RUN_MANIFEST_JSON);
+        let mut manifest: RunManifest = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("run_manifest.json should be readable"),
+        )
+        .expect("run_manifest.json should parse");
+        mutate(&mut manifest);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("run manifest should serialize"),
+        )
+        .expect("run_manifest.json should be rewritten");
+        refresh_report_checksum(report_dir);
+    }
+
+    fn refresh_report_checksum(report_dir: &Path) {
+        let summary: SampleSummary = serde_json::from_str(
+            &fs::read_to_string(report_dir.join(SAMPLE_SUMMARY_JSON))
+                .expect("sample_summary.json should be readable"),
+        )
+        .expect("sample_summary.json should parse");
+        let manifest: RunManifest = serde_json::from_str(
+            &fs::read_to_string(report_dir.join(RUN_MANIFEST_JSON))
+                .expect("run_manifest.json should be readable"),
+        )
+        .expect("run_manifest.json should parse");
+
+        ReportWriter::write(
+            report_dir,
+            &summary,
+            &candidate_fixtures(),
+            &round_fixtures(),
+            &manifest,
+        )
+            .expect("report bundle should be rewritten with refreshed checksum");
     }
 
     fn sample_summary_fixture(reference_version: &str) -> SampleSummary {
@@ -981,7 +1294,7 @@ mod tests {
             rounds_run: 2,
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
-            release_status: ReleaseStatus::Provisional,
+            release_status: ReleaseStatus::Final,
         }
     }
 
@@ -991,6 +1304,13 @@ mod tests {
             calibration_profile_version: "rvscreen_calib_2026.04.21-r1".to_string(),
             backend: "minimap2".to_string(),
             seed: 20_260_421,
+            sampling_mode: "representative".to_string(),
+            negative_control: NegativeControlManifest {
+                required: false,
+                status: NegativeControlStatus::Pass,
+                control_id: Some("neg-001".to_string()),
+                control_status: Some("pass".to_string()),
+            },
             input_files: vec![
                 "reads_R1.fastq.gz".to_string(),
                 "reads_R2.fastq.gz".to_string(),

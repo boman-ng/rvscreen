@@ -6,11 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CARGO_BUILD_JOBS: "16"
+  RAYON_NUM_THREADS: "16"
+  RVSCREEN_BENCH_CI: "1"
+  RVSCREEN_BENCH_MAX_THREADS: "16"
+
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -20,7 +29,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang musl-tools
+        run: sudo apt-get update && sudo apt-get install -y cmake clang llvm-dev libclang-dev musl-tools
+
+      - name: Resolve libclang path
+        shell: bash
+        run: |
+          libclang_path="$(llvm-config --libdir)"
+          if ! compgen -G "${libclang_path}/libclang.so*" > /dev/null; then
+            printf 'libclang shared library not found under %s\n' "${libclang_path}" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=${libclang_path}" >> "$GITHUB_ENV"
+
+      - name: Resolve bindgen include args
+        shell: bash
+        run: |
+          gcc_bin="/usr/bin/gcc"
+          if [ ! -x "${gcc_bin}" ]; then
+            gcc_bin="$(command -v gcc)"
+          fi
+          gcc_include_dir="$(${gcc_bin} -print-file-name=include)"
+          if [ -z "${gcc_include_dir}" ] || [ "${gcc_include_dir}" = "include" ] || [ ! -d "${gcc_include_dir}" ]; then
+            printf 'gcc builtin include directory not found via %s: %s\n' "${gcc_bin}" "${gcc_include_dir}" >&2
+            exit 1
+          fi
+          printf 'BINDGEN_EXTRA_CLANG_ARGS=%s\n' "-I${gcc_include_dir} -I/usr/include" >> "$GITHUB_ENV"
+
+      - name: Resolve perf artifact paths
+        shell: bash
+        run: |
+          echo "RVSCREEN_PERF_ARTIFACT_ROOT=${RUNNER_TEMP}/rvscreen-ci-perf" >> "$GITHUB_ENV"
+          echo "RVSCREEN_PERF_CURRENT_DIR=${RUNNER_TEMP}/rvscreen-ci-perf/current" >> "$GITHUB_ENV"
+          echo "RVSCREEN_PERF_BASE_DIR=${RUNNER_TEMP}/rvscreen-ci-perf/base" >> "$GITHUB_ENV"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "RVSCREEN_PERF_BASE_SHA=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_ENV"
+          elif [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "RVSCREEN_PERF_BASE_SHA=${{ github.event.before }}" >> "$GITHUB_ENV"
+          fi
 
       - name: cargo check
         run: cargo check
@@ -31,11 +76,38 @@ jobs:
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
+      - name: Capture current perf evidence
+        shell: bash
+        run: |
+          bash scripts/capture_ci_perf.sh "${RVSCREEN_PERF_CURRENT_DIR}"
+
+      - name: Capture baseline perf evidence
+        if: env.RVSCREEN_PERF_BASE_SHA != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          git worktree add "${RUNNER_TEMP}/rvscreen-perf-base-repo" "${RVSCREEN_PERF_BASE_SHA}"
+          trap 'git worktree remove --force "${RUNNER_TEMP}/rvscreen-perf-base-repo"' EXIT
+          RVSCREEN_CAPTURE_REPO_ROOT="${RUNNER_TEMP}/rvscreen-perf-base-repo" CARGO_TARGET_DIR="${RUNNER_TEMP}/rvscreen-perf-base-target" bash scripts/capture_ci_perf.sh "${RVSCREEN_PERF_BASE_DIR}"
+
+      - name: Validate perf evidence and obvious regressions
+        env:
+          RVSCREEN_PERF_GATE_CURRENT_DIR: ${{ env.RVSCREEN_PERF_CURRENT_DIR }}
+          RVSCREEN_PERF_GATE_BASE_DIR: ${{ env.RVSCREEN_PERF_BASE_DIR }}
+        run: cargo test --test perf_gate -- --nocapture
+
+      - name: Upload perf evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvscreen-ci-perf-evidence
+          path: ${{ env.RVSCREEN_PERF_ARTIFACT_ROOT }}
+          if-no-files-found: warn
+
       - name: Build musl static binary
         env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          LIBCLANG_PATH: /usr/lib/llvm-14/lib
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/usr/include"
+          CC_x86_64_unknown_linux_musl: /usr/bin/musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: /usr/bin/musl-gcc
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/release/rvscreen

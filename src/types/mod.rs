@@ -89,6 +89,14 @@ pub enum ReleaseStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
+pub enum NegativeControlStatus {
+    Missing,
+    Pass,
+    Fail,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum FragmentClass {
     Host,
     Virus,
@@ -153,7 +161,19 @@ pub struct RunManifest {
     pub calibration_profile_version: String,
     pub backend: String,
     pub seed: u64,
+    pub sampling_mode: String,
+    pub negative_control: NegativeControlManifest,
     pub input_files: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NegativeControlManifest {
+    pub required: bool,
+    pub status: NegativeControlStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_status: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -295,6 +315,10 @@ allow_indeterminate = true
         assert_json_roundtrip(ReleaseStatus::Provisional, "\"provisional\"");
         assert_json_roundtrip(ReleaseStatus::Blocked, "\"blocked\"");
 
+        assert_json_roundtrip(NegativeControlStatus::Missing, "\"missing\"");
+        assert_json_roundtrip(NegativeControlStatus::Pass, "\"pass\"");
+        assert_json_roundtrip(NegativeControlStatus::Fail, "\"fail\"");
+
         assert_json_roundtrip(FragmentClass::Host, "\"host\"");
         assert_json_roundtrip(FragmentClass::Virus, "\"virus\"");
         assert_json_roundtrip(FragmentClass::Ambiguous, "\"ambiguous\"");
@@ -353,6 +377,13 @@ allow_indeterminate = true
             calibration_profile_version: "rvscreen_calib_2026.04.20-r1".into(),
             backend: "minimap2".into(),
             seed: 20_260_420,
+            sampling_mode: "representative".into(),
+            negative_control: NegativeControlManifest {
+                required: true,
+                status: NegativeControlStatus::Pass,
+                control_id: Some("neg-001".into()),
+                control_status: Some("pass".into()),
+            },
             input_files: vec!["reads_R1.fastq.gz".into(), "reads_R2.fastq.gz".into()],
         };
         let run_manifest_json =

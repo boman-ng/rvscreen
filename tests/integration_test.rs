@@ -6,7 +6,8 @@ use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
 use rvscreen::report::ReportWriter;
 use rvscreen::types::{
     BundleManifest, BundleToml, CandidateCall, ContigEntry, DecisionStatus, EvidenceStrength,
-    ReleaseStatus, RoundRecord, RunManifest, SampleSummary, SamplingConfig, StopReason,
+    NegativeControlManifest, NegativeControlStatus, ReleaseStatus, RoundRecord, RunManifest,
+    SampleSummary, SamplingConfig, StopReason,
 };
 use rvscreen::{
     calibration::{
@@ -695,6 +696,130 @@ fn integration_full_chain_ref_build_calibrate_screen_audit_verify() {
 }
 
 #[test]
+fn integration_full_chain_report_manifest_keeps_sampling_and_negative_control_provenance() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle = prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-manifest-provenance"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            negative_control_required: true,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("calibration profile should be written");
+    let negative_control = write_negative_control(
+        tempdir.path().join("negative-control.json"),
+        "pass",
+        &[("NC_SYNTHV1.1", 0.0)],
+    )
+    .expect("negative control should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 196)
+            .with_output_dir(tempdir.path().join("fastq-manifest-provenance"))
+            .with_components(vec![
+                ReadComponent::new(SyntheticSource::Human, 0.95),
+                ReadComponent::new(
+                    SyntheticSource::Virus(VirusSelector::Accession("NC_SYNTHV1.1".to_string())),
+                    0.05,
+                ),
+            ]),
+    )
+    .expect("FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-manifest-provenance");
+
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.clone().into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.clone().into_os_string(),
+        os("--negative-control"),
+        negative_control.into_os_string(),
+        os("--out"),
+        out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+    ]);
+
+    let manifest: RunManifest = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("run_manifest.json"))
+            .expect("run_manifest.json should be readable"),
+    )
+    .expect("run_manifest.json should parse");
+    assert_eq!(manifest.sampling_mode, "representative");
+    assert_eq!(manifest.negative_control.required, true);
+    assert_eq!(manifest.negative_control.status, NegativeControlStatus::Pass);
+    assert_eq!(manifest.negative_control.control_id.as_deref(), Some("neg-001"));
+    assert_eq!(manifest.negative_control.control_status.as_deref(), Some("pass"));
+    assert!(out_dir.join("checksum.sha256").exists());
+}
+
+#[test]
+fn integration_streaming_required_negative_control_missing_is_blocked_not_collapsed() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle = prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-streaming-blocked"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            negative_control_required: true,
+            sampling_mode: "streaming",
+            rounds: vec![50, 100],
+            max_rounds: 2,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("streaming calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 197)
+            .with_output_dir(tempdir.path().join("fastq-streaming-blocked"))
+            .with_components(vec![
+                ReadComponent::new(
+                    SyntheticSource::Virus(VirusSelector::Accession("NC_SYNTHV1.1".to_string())),
+                    0.05,
+                ),
+                ReadComponent::new(SyntheticSource::Human, 0.95),
+            ]),
+    )
+    .expect("FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-streaming-blocked");
+
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.clone().into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--out"),
+        out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("streaming"),
+    ]);
+
+    let summary = read_summary(&out_dir);
+    assert_eq!(summary.decision_status, DecisionStatus::Positive);
+    assert_eq!(summary.release_status, ReleaseStatus::Blocked);
+
+    let manifest: RunManifest = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("run_manifest.json"))
+            .expect("run_manifest.json should be readable"),
+    )
+    .expect("run_manifest.json should parse");
+    assert_eq!(manifest.sampling_mode, "streaming");
+    assert_eq!(manifest.negative_control.required, true);
+    assert_eq!(manifest.negative_control.status, NegativeControlStatus::Missing);
+}
+
+#[test]
 fn audit_verify_passes_valid_report_bundle() {
     let tempdir = tempdir().expect("tempdir should be created");
     let fixture = write_audit_verify_fixture(tempdir.path(), "rvscreen_ref_2026.04.21-r1")
@@ -933,6 +1058,11 @@ fn write_calibration_profile_stub(dir: &Path, reference_version: &str) -> io::Re
         })
         .map_err(io_other)?,
     )
+    ?;
+    fs::write(
+        dir.join("release_gate.json"),
+        serde_json::to_vec_pretty(&passing_release_gate()).map_err(io_other)?,
+    )
 }
 
 fn audit_sample_summary(reference_version: &str) -> SampleSummary {
@@ -948,21 +1078,28 @@ fn audit_sample_summary(reference_version: &str) -> SampleSummary {
         rounds_run: 2,
         stop_reason: StopReason::PositiveBoundaryCrossed,
         decision_status: DecisionStatus::Positive,
-        release_status: ReleaseStatus::Provisional,
+        release_status: ReleaseStatus::Final,
     }
 }
 
-fn audit_run_manifest(reference_version: &str) -> RunManifest {
-    RunManifest {
-        reference_bundle_version: reference_version.to_string(),
-        calibration_profile_version: "rvscreen_calib_2026.04.21-r1".to_string(),
-        backend: "minimap2".to_string(),
-        seed: 20_260_421,
-        input_files: vec![
-            "reads_R1.fastq.gz".to_string(),
-            "reads_R2.fastq.gz".to_string(),
-        ],
-    }
+    fn audit_run_manifest(reference_version: &str) -> RunManifest {
+        RunManifest {
+            reference_bundle_version: reference_version.to_string(),
+            calibration_profile_version: "rvscreen_calib_2026.04.21-r1".to_string(),
+            backend: "minimap2".to_string(),
+            seed: 20_260_421,
+            sampling_mode: "representative".to_string(),
+            negative_control: NegativeControlManifest {
+                required: false,
+                status: NegativeControlStatus::Pass,
+                control_id: Some("neg-001".to_string()),
+                control_status: Some("pass".to_string()),
+            },
+            input_files: vec![
+                "reads_R1.fastq.gz".to_string(),
+                "reads_R2.fastq.gz".to_string(),
+            ],
+        }
 }
 
 fn audit_rounds() -> Vec<RoundRecord> {
@@ -1337,6 +1474,7 @@ fn assert_report_bundle_artifacts(report_dir: &Path) {
     for artifact in [
         "sample_summary.json",
         "candidate_calls.tsv",
+        "checksum.sha256",
         "run_manifest.json",
         "rounds.tsv",
         "logs/run.log",
@@ -1440,4 +1578,435 @@ fn write_taxonomy(path: &Path, entries: &[ContigEntry]) -> io::Result<()> {
 
 fn io_other(error: impl ToString) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+// ============================================================================
+// Task 8: Cross-Format Reader Contract Verification Tests
+// ============================================================================
+//
+// These tests verify that all three input formats (FASTQ, BAM, CRAM) satisfy
+// the unified reader contract specified in `src/io/input.rs`.
+
+#[cfg(test)]
+mod cross_format_reader_contract {
+    use noodles::{
+        bam, cram,
+        fasta::{self, repository::adapters::IndexedReader},
+        sam::{
+            self,
+            alignment::{RecordBuf, io::Write as _},
+            header::record::value::{Map, map::ReferenceSequence},
+        },
+    };
+    use rvscreen::io::{FragmentReaderFactory, FragmentRecord, ScreenInput};
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::num::NonZeroUsize;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    #[test]
+    fn task8_all_formats_yield_identical_fragment_records_via_factory() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let fixture = create_cross_format_fixture(tempdir.path())
+            .expect("cross-format fixture should be written");
+
+        let fastq_records = ScreenInput::FastqPair {
+            r1: fixture.fastq_r1.clone(),
+            r2: fixture.fastq_r2.clone(),
+        }
+        .open_reader()
+        .expect("FASTQ reader should open")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("FASTQ fragments should collect");
+        let bam_records = ScreenInput::Bam {
+            path: fixture.bam_path.clone(),
+        }
+        .open_reader()
+        .expect("BAM reader should open")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("BAM fragments should collect");
+        let cram_records = ScreenInput::Cram {
+            path: fixture.cram_path.clone(),
+            reference_fasta: fixture.reference_path.clone(),
+        }
+        .open_reader()
+        .expect("CRAM reader should open")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("CRAM fragments should collect");
+
+        let expected = vec![FragmentRecord {
+            fragment_key: "READ:1:FCX123:1:1101:1000:2000".to_string(),
+            r1_seq: b"ACGT".to_vec(),
+            r1_qual: vec![30, 31, 32, 33],
+            r2_seq: b"TGCA".to_vec(),
+            r2_qual: vec![34, 35, 36, 37],
+        }];
+
+        assert_eq!(fastq_records, expected);
+        assert_eq!(bam_records, expected);
+        assert_eq!(cram_records, expected);
+    }
+
+    #[test]
+    fn task8_reader_factories_remain_pull_based_trait_objects() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let fixture = create_cross_format_fixture(tempdir.path())
+            .expect("cross-format fixture should be written");
+
+        let inputs = [
+            ScreenInput::FastqPair {
+                r1: fixture.fastq_r1.clone(),
+                r2: fixture.fastq_r2.clone(),
+            },
+            ScreenInput::Bam {
+                path: fixture.bam_path.clone(),
+            },
+            ScreenInput::Cram {
+                path: fixture.cram_path.clone(),
+                reference_fasta: fixture.reference_path.clone(),
+            },
+        ];
+
+        for input in &inputs {
+            let factory: &dyn FragmentReaderFactory = input;
+            let mut reader = factory
+                .open_reader()
+                .expect("reader should open via trait object");
+
+            let first = reader
+                .next()
+                .expect("first fragment should exist")
+                .expect("first fragment should decode");
+            assert_eq!(first.fragment_key, "READ:1:FCX123:1:1101:1000:2000");
+            assert!(reader.next().is_none(), "fixture should contain exactly one fragment");
+        }
+    }
+
+    #[test]
+    fn task8_kind_label_distinguishes_formats() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let fixture = create_cross_format_fixture(tempdir.path())
+            .expect("cross-format fixture should be written");
+        let fastq_input = ScreenInput::FastqPair {
+            r1: fixture.fastq_r1.clone(),
+            r2: fixture.fastq_r2.clone(),
+        };
+
+        assert_eq!(fastq_input.kind_label(), "fastq");
+
+        let bam_input = ScreenInput::Bam {
+            path: PathBuf::from("test.bam"),
+        };
+        assert_eq!(bam_input.kind_label(), "bam");
+
+        let cram_input = ScreenInput::Cram {
+            path: PathBuf::from("test.cram"),
+            reference_fasta: PathBuf::from("ref.fa"),
+        };
+        assert_eq!(cram_input.kind_label(), "cram");
+    }
+
+    struct CrossFormatFixture {
+        fastq_r1: PathBuf,
+        fastq_r2: PathBuf,
+        bam_path: PathBuf,
+        cram_path: PathBuf,
+        reference_path: PathBuf,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SyntheticBamRecord {
+        qname: String,
+        flags: sam::alignment::record::Flags,
+        sequence: Vec<u8>,
+        quality_scores: Vec<u8>,
+    }
+
+    impl SyntheticBamRecord {
+        fn first(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::new(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::FIRST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn last(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::new(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::LAST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn new(
+            qname: &str,
+            flags: sam::alignment::record::Flags,
+            sequence: &[u8],
+            quality_scores: &[u8],
+        ) -> Self {
+            Self {
+                qname: qname.to_owned(),
+                flags,
+                sequence: sequence.to_vec(),
+                quality_scores: quality_scores.to_vec(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SyntheticCramRecord {
+        qname: String,
+        flags: sam::alignment::record::Flags,
+        sequence: Vec<u8>,
+        quality_scores: Vec<u8>,
+    }
+
+    impl SyntheticCramRecord {
+        fn first(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::new(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::FIRST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn last(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::new(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::LAST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn new(
+            qname: &str,
+            flags: sam::alignment::record::Flags,
+            sequence: &[u8],
+            quality_scores: &[u8],
+        ) -> Self {
+            Self {
+                qname: qname.to_owned(),
+                flags,
+                sequence: sequence.to_vec(),
+                quality_scores: quality_scores.to_vec(),
+            }
+        }
+
+        fn to_record_buf(&self) -> RecordBuf {
+            RecordBuf::builder()
+                .set_name(self.qname.clone())
+                .set_flags(self.flags)
+                .set_sequence(self.sequence.clone().into())
+                .set_quality_scores(self.quality_scores.clone().into())
+                .build()
+        }
+    }
+
+    fn create_cross_format_fixture(base_dir: &Path) -> io::Result<CrossFormatFixture> {
+        let qname = "READ:1:FCX123:1:1101:1000:2000";
+        let fastq_r1 = base_dir.join("test_R1.fastq");
+        let fastq_r2 = base_dir.join("test_R2.fastq");
+        let bam_path = base_dir.join("test.bam");
+        let cram_path = base_dir.join("test.cram");
+        let reference_path = base_dir.join("reference.fa");
+        let reference_sequence = "ACGT".repeat(3000);
+
+        std::fs::write(&fastq_r1, format!("@{qname}/1\nACGT\n+\n?@AB\n"))?;
+        std::fs::write(&fastq_r2, format!("@{qname}/2\nTGCA\n+\nCDEF\n"))?;
+
+        write_test_bam(
+            &bam_path,
+            &[
+                SyntheticBamRecord::last(qname, b"TGCA", &[34, 35, 36, 37]),
+                SyntheticBamRecord::first(qname, b"ACGT", &[30, 31, 32, 33]),
+            ],
+        )?;
+
+        write_test_reference(&reference_path, "chr1", &reference_sequence)?;
+        write_test_cram(
+            &cram_path,
+            &reference_path,
+            "chr1",
+            reference_sequence.len(),
+            &[
+                SyntheticCramRecord::last(qname, b"TGCA", &[34, 35, 36, 37]),
+                SyntheticCramRecord::first(qname, b"ACGT", &[30, 31, 32, 33]),
+            ],
+        )?;
+
+        Ok(CrossFormatFixture {
+            fastq_r1,
+            fastq_r2,
+            bam_path,
+            cram_path,
+            reference_path,
+        })
+    }
+
+    fn write_test_bam(path: &Path, records: &[SyntheticBamRecord]) -> io::Result<()> {
+        const BAM_MAGIC_NUMBER: [u8; 4] = *b"BAM\x01";
+
+        let file = File::create(path)?;
+        let mut writer = bam::io::Writer::new(file);
+
+        writer.get_mut().write_all(&encode_bam_header(BAM_MAGIC_NUMBER))?;
+        for record in records {
+            writer.get_mut().write_all(&encode_bam_record(record)?)?;
+        }
+
+        writer.try_finish()?;
+
+        Ok(())
+    }
+
+    fn encode_bam_header(magic_number: [u8; 4]) -> Vec<u8> {
+        let raw_header = "@HD\tVN:1.6\tSO:queryname\n";
+        let mut encoded = Vec::new();
+        encoded.extend(magic_number);
+        encoded.extend((raw_header.len() as u32).to_le_bytes());
+        encoded.extend(raw_header.as_bytes());
+        encoded.extend(0u32.to_le_bytes());
+        encoded
+    }
+
+    fn encode_bam_record(record: &SyntheticBamRecord) -> io::Result<Vec<u8>> {
+        if record.sequence.len() != record.quality_scores.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sequence length must match quality-score length",
+            ));
+        }
+
+        let read_name = format!("{}\0", record.qname).into_bytes();
+        let seq_len = i32::try_from(record.sequence.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let read_name_len = u8::try_from(read_name.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let bin_mq_nl =
+            u32::from(read_name_len) | (u32::from(255u8) << 8) | (u32::from(4680u16) << 16);
+        let flag_nc = u32::from(u16::from(record.flags)) << 16;
+        let packed_sequence = pack_sequence(&record.sequence)?;
+
+        let mut body = Vec::new();
+        body.extend((-1i32).to_le_bytes());
+        body.extend((-1i32).to_le_bytes());
+        body.extend(bin_mq_nl.to_le_bytes());
+        body.extend(flag_nc.to_le_bytes());
+        body.extend(seq_len.to_le_bytes());
+        body.extend((-1i32).to_le_bytes());
+        body.extend((-1i32).to_le_bytes());
+        body.extend(0i32.to_le_bytes());
+        body.extend(read_name);
+        body.extend(packed_sequence);
+        body.extend(&record.quality_scores);
+
+        let block_size = u32::try_from(body.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut encoded = Vec::with_capacity(body.len() + 4);
+        encoded.extend(block_size.to_le_bytes());
+        encoded.extend(body);
+        Ok(encoded)
+    }
+
+    fn pack_sequence(sequence: &[u8]) -> io::Result<Vec<u8>> {
+        let mut packed = Vec::with_capacity(sequence.len().div_ceil(2));
+
+        for chunk in sequence.chunks(2) {
+            let left = encode_base(chunk[0])? << 4;
+            let right = chunk
+                .get(1)
+                .copied()
+                .map(encode_base)
+                .transpose()?
+                .unwrap_or(0);
+            packed.push(left | right);
+        }
+
+        Ok(packed)
+    }
+
+    fn encode_base(base: u8) -> io::Result<u8> {
+        match base.to_ascii_uppercase() {
+            b'=' => Ok(0),
+            b'A' => Ok(1),
+            b'C' => Ok(2),
+            b'G' => Ok(4),
+            b'T' => Ok(8),
+            b'N' => Ok(15),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported BAM test base `{}`", char::from(other)),
+            )),
+        }
+    }
+
+    fn write_test_reference(path: &Path, name: &str, sequence: &str) -> io::Result<()> {
+        let mut fasta = File::create(path)?;
+        writeln!(fasta, ">{name}")?;
+        writeln!(fasta, "{sequence}")?;
+
+        let sequence_offset = (name.len() + 2) as u64;
+        let fai_body = format!(
+            "{name}\t{}\t{sequence_offset}\t{}\t{}\n",
+            sequence.len(),
+            sequence.len(),
+            sequence.len() + 1,
+        );
+        std::fs::write(reference_fai_path(path), fai_body)
+    }
+
+    fn write_test_cram(
+        path: &Path,
+        reference_path: &Path,
+        reference_name: &str,
+        reference_len: usize,
+        records: &[SyntheticCramRecord],
+    ) -> io::Result<()> {
+        let repository = fasta::io::indexed_reader::Builder::default()
+            .build_from_path(reference_path)
+            .map(IndexedReader::new)
+            .map(fasta::Repository::new)?;
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                reference_name,
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(reference_len).unwrap()),
+            )
+            .build();
+        let file = File::create(path)?;
+        let mut writer = cram::io::writer::Builder::default()
+            .set_reference_sequence_repository(repository)
+            .build_from_writer(file);
+
+        writer.write_header(&header)?;
+
+        for record in records {
+            writer.write_alignment_record(&header, &record.to_record_buf())?;
+        }
+
+        writer.try_finish(&header)
+    }
+
+    fn reference_fai_path(reference_path: &Path) -> PathBuf {
+        let mut fai = reference_path.as_os_str().to_owned();
+        fai.push(".fai");
+        PathBuf::from(fai)
+    }
 }

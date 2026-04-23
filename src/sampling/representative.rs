@@ -54,6 +54,14 @@ impl RepresentativeSampler {
         self.hash_fragment_key(fragment_key) % self.bucket_universe
     }
 
+    pub fn entry_round_for(&self, fragment_key: &str) -> Option<usize> {
+        self.entry_round_for_bucket(self.bucket_for(fragment_key))
+    }
+
+    pub fn entry_round_for_bucket(&self, bucket: u64) -> Option<usize> {
+        self.rounds.iter().position(|target| bucket < *target)
+    }
+
     pub fn should_accept(&self, fragment_key: &str, round: usize) -> bool {
         self.round_target(round)
             .is_some_and(|target| self.bucket_for(fragment_key) < target)
@@ -255,6 +263,26 @@ mod tests {
             .collect();
 
         assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn test_entry_round_tracks_first_round_that_accepts_each_fragment() {
+        let sampler = RepresentativeSampler::new(42, vec![10, 20, 40])
+            .expect("representative rounds should be valid");
+
+        for key in (0..5_000).map(fragment_key) {
+            let accepted_rounds: Vec<usize> = (0..sampler.round_count())
+                .filter(|&round| sampler.should_accept(&key, round))
+                .collect();
+
+            match sampler.entry_round_for(&key) {
+                Some(entry_round) => {
+                    let expected_rounds = (entry_round..sampler.round_count()).collect::<Vec<_>>();
+                    assert_eq!(accepted_rounds, expected_rounds);
+                }
+                None => assert!(accepted_rounds.is_empty()),
+            }
+        }
     }
 
     #[test]

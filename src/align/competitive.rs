@@ -11,6 +11,7 @@ use std::sync::Arc;
 const DEFAULT_BEST_N: i32 = 5;
 const DEFAULT_CAP_KALLOC: i64 = 512 * 1024 * 1024;
 const TOTAL_KALLOC_BUDGET: u64 = 1_000_000_000;
+const MAX_THREAD_BUDGET: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompetitivePreset {
@@ -65,6 +66,8 @@ pub struct CompetitiveAligner {
     reference_input: PathBuf,
     manifest_path: PathBuf,
     preset: CompetitivePreset,
+    thread_budget: usize,
+    kalloc_cap: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +112,20 @@ impl CompetitiveAligner {
 
         let (reference_input, manifest_path) =
             resolve_bundle_inputs(reference_bundle_path.as_ref())?;
+        Self::from_resolved_inputs(reference_input, manifest_path, preset, threads)
+    }
+
+    pub(crate) fn from_resolved_inputs(
+        reference_input: PathBuf,
+        manifest_path: PathBuf,
+        preset: CompetitivePreset,
+        threads: usize,
+    ) -> Result<Self> {
+        let thread_budget = normalize_thread_budget(threads)?;
         let manifest = load_manifest(&manifest_path)?;
         let (contig_classes, virus_targets) = build_contig_indexes(&manifest)?;
-        let aligner = build_competitive_aligner(&reference_input, preset, threads)?;
+        let kalloc_cap = per_thread_kalloc_cap(thread_budget);
+        let aligner = build_competitive_aligner(&reference_input, preset, kalloc_cap)?;
 
         Ok(Self {
             aligner: Arc::new(aligner),
@@ -120,6 +134,8 @@ impl CompetitiveAligner {
             reference_input,
             manifest_path,
             preset,
+            thread_budget,
+            kalloc_cap,
         })
     }
 
@@ -161,6 +177,23 @@ impl CompetitiveAligner {
 
     pub fn preset(&self) -> CompetitivePreset {
         self.preset
+    }
+
+    pub fn thread_budget(&self) -> usize {
+        self.thread_budget
+    }
+
+    pub fn kalloc_cap(&self) -> i64 {
+        self.kalloc_cap
+    }
+
+    pub fn uses_prebuilt_index(&self) -> bool {
+        is_mmi_path(&self.reference_input)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_instance_id(&self) -> usize {
+        Arc::as_ptr(&self.aligner) as usize
     }
 
     fn aggregate_hits(
@@ -314,7 +347,7 @@ enum Mate {
     Read2,
 }
 
-fn resolve_bundle_inputs(bundle_path: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn resolve_bundle_inputs(bundle_path: &Path) -> Result<(PathBuf, PathBuf)> {
     let metadata = fs::metadata(bundle_path).map_err(|err| RvScreenError::io(bundle_path, err))?;
 
     if metadata.is_file() {
@@ -364,8 +397,8 @@ fn validate_manifest_path(path: &Path) -> Result<()> {
 fn discover_reference_input(bundle_dir: &Path) -> Result<PathBuf> {
     let preferred_candidates = [
         bundle_dir.join("index/minimap2/composite.mmi"),
-        bundle_dir.join("composite.fa"),
         bundle_dir.join("composite.mmi"),
+        bundle_dir.join("composite.fa"),
         bundle_dir.join("mini_reference.fa"),
     ];
 
@@ -388,7 +421,26 @@ fn discover_reference_input(bundle_dir: &Path) -> Result<PathBuf> {
     discovered.sort();
     discovered.dedup();
 
-    match discovered.as_slice() {
+    let (mmi_inputs, fasta_inputs): (Vec<_>, Vec<_>) = discovered
+        .into_iter()
+        .partition(|path| is_mmi_path(path));
+
+    match mmi_inputs.as_slice() {
+        [single] => return Ok(single.clone()),
+        [] => {}
+        many => {
+            return Err(RvScreenError::validation(
+                "reference_bundle",
+                format!(
+                    "multiple candidate minimap2 indexes found in `{}`: {}",
+                    bundle_dir.display(),
+                    format_candidate_inputs(many)
+                ),
+            ))
+        }
+    }
+
+    match fasta_inputs.as_slice() {
         [single] => Ok(single.clone()),
         [] => Err(RvScreenError::validation(
             "reference_bundle",
@@ -400,19 +452,25 @@ fn discover_reference_input(bundle_dir: &Path) -> Result<PathBuf> {
         many => Err(RvScreenError::validation(
             "reference_bundle",
             format!(
-                "multiple candidate reference inputs found in `{}`: {}",
+                "multiple candidate FASTA reference inputs found in `{}`: {}",
                 bundle_dir.display(),
-                many.iter()
-                    .map(|path| path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                format_candidate_inputs(many)
             ),
         )),
     }
+}
+
+fn format_candidate_inputs(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn load_manifest(path: &Path) -> Result<BundleManifest> {
@@ -507,13 +565,13 @@ fn normalize_metadata_value(value: &str) -> String {
 fn build_competitive_aligner(
     reference_input: &Path,
     preset: CompetitivePreset,
-    threads: usize,
+    kalloc_cap: i64,
 ) -> Result<Aligner<Built>> {
     let mut builder = match preset {
         CompetitivePreset::SrConservative => Aligner::builder().sr().with_cigar(),
     };
     builder.mapopt.best_n = DEFAULT_BEST_N;
-    builder.mapopt.cap_kalloc = per_thread_kalloc_cap(threads);
+    builder.mapopt.cap_kalloc = kalloc_cap;
 
     builder.with_index(reference_input, None).map_err(|reason| {
         RvScreenError::validation(
@@ -526,11 +584,28 @@ fn build_competitive_aligner(
     })
 }
 
+fn normalize_thread_budget(threads: usize) -> Result<usize> {
+    if threads == 0 {
+        return Err(RvScreenError::validation(
+            "threads",
+            "--threads must be greater than zero",
+        ));
+    }
+
+    Ok(threads.min(MAX_THREAD_BUDGET))
+}
+
 fn per_thread_kalloc_cap(threads: usize) -> i64 {
-    let threads = threads.max(1);
+    let threads = normalize_thread_budget(threads).unwrap_or(1);
     let cap = TOTAL_KALLOC_BUDGET / u64::try_from(threads).unwrap_or(u64::MAX).max(1);
     let cap = cap.max(1);
     i64::try_from(cap).unwrap_or(DEFAULT_CAP_KALLOC)
+}
+
+fn is_mmi_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mmi"))
 }
 
 fn select_best_hit(
@@ -899,8 +974,44 @@ mod tests {
     }
 
     #[test]
+    fn discover_reference_input_prefers_prebuilt_mmi_over_fasta() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bundle_dir = tempdir.path();
+        let manifest_path = bundle_dir.join("manifest.json");
+        fs::write(&manifest_path, "[]").expect("manifest should be written");
+        fs::write(bundle_dir.join("composite.fa"), ">contig\nACGT\n")
+            .expect("fasta should be written");
+        let index_dir = bundle_dir.join("index/minimap2");
+        fs::create_dir_all(&index_dir).expect("index directory should be created");
+        fs::write(index_dir.join("composite.mmi"), b"mmi")
+            .expect("mmi should be written");
+
+        let discovered =
+            discover_reference_input(bundle_dir).expect("reference input should be discovered");
+
+        assert!(discovered.ends_with("index/minimap2/composite.mmi"));
+        assert!(is_mmi_path(&discovered));
+    }
+
+    #[test]
     fn per_thread_kalloc_cap_scales_with_threads() {
         assert_eq!(per_thread_kalloc_cap(1), 1_000_000_000);
         assert_eq!(per_thread_kalloc_cap(4), 250_000_000);
+        assert_eq!(per_thread_kalloc_cap(16), 62_500_000);
+    }
+
+    #[test]
+    fn competitive_aligner_caps_thread_budget_to_safe_global_limit() {
+        let reference_dir =
+            generate_mini_reference().expect("mini reference generation should succeed");
+        let aligner = CompetitiveAligner::new_with_threads(
+            &reference_dir,
+            CompetitivePreset::SrConservative,
+            MAX_THREAD_BUDGET + 8,
+        )
+        .expect("aligner should load cleanly at the safe global limit");
+
+        assert_eq!(aligner.thread_budget(), MAX_THREAD_BUDGET);
+        assert_eq!(aligner.kalloc_cap(), per_thread_kalloc_cap(MAX_THREAD_BUDGET));
     }
 }

@@ -1,5 +1,5 @@
 use crate::error::{Result, RvScreenError};
-use crate::types::CandidateCall;
+use crate::types::{CandidateCall, NegativeControlManifest, NegativeControlStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -87,6 +87,29 @@ impl NegativeControlDecisionInput {
             })
         } else {
             Ok(Self::Failed(result))
+        }
+    }
+
+    pub fn manifest(&self, required: bool) -> NegativeControlManifest {
+        match self {
+            Self::Missing => NegativeControlManifest {
+                required,
+                status: NegativeControlStatus::Missing,
+                control_id: None,
+                control_status: None,
+            },
+            Self::Failed(result) => NegativeControlManifest {
+                required,
+                status: NegativeControlStatus::Fail,
+                control_id: Some(result.control_id.clone()),
+                control_status: Some(result.control_status.clone()),
+            },
+            Self::Passed { result, .. } => NegativeControlManifest {
+                required,
+                status: NegativeControlStatus::Pass,
+                control_id: Some(result.control_id.clone()),
+                control_status: Some(result.control_status.clone()),
+            },
         }
     }
 }

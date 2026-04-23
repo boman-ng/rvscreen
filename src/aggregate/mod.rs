@@ -61,6 +61,35 @@ impl CandidateAggregator {
         self.total_sampled_fragments = Some(total_sampled_fragments);
     }
 
+    pub(crate) fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.level != other.level {
+            return Err(RvScreenError::validation(
+                "aggregate.level",
+                format!(
+                    "cannot merge aggregation levels `{}` and `{}`",
+                    self.level.label(),
+                    other.level.label()
+                ),
+            ));
+        }
+
+        self.fragments_seen = self.fragments_seen.saturating_add(other.fragments_seen);
+        self.total_sampled_fragments = None;
+
+        for (candidate_key, candidate) in other.candidates {
+            match self.candidates.entry(candidate_key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge_from(candidate)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn add_fragment(
         &mut self,
         class: FragmentClass,
@@ -229,6 +258,95 @@ impl CandidateAccumulator {
             .entry(hit.contig.clone())
             .or_default()
             .push(Interval::new(hit.reference_start, hit.reference_end));
+        Ok(())
+    }
+
+    fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.level != other.level {
+            return Err(RvScreenError::validation(
+                "aggregate.level",
+                format!(
+                    "cannot merge candidate `{}` across aggregation levels `{}` and `{}`",
+                    self.accession_or_group,
+                    self.level.label(),
+                    other.level.label()
+                ),
+            ));
+        }
+
+        if self.accession_or_group != other.accession_or_group {
+            return Err(RvScreenError::validation(
+                "aggregate.candidate_key",
+                format!(
+                    "cannot merge candidate accumulators `{}` and `{}`",
+                    self.accession_or_group, other.accession_or_group
+                ),
+            ));
+        }
+
+        if self.taxid != other.taxid {
+            return Err(RvScreenError::validation(
+                "aggregate.taxid",
+                format!(
+                    "conflicting taxid values within candidate `{}`: {} vs {}",
+                    self.accession_or_group, self.taxid, other.taxid
+                ),
+            ));
+        }
+
+        if self.level == AggregationLevel::Accession
+            && self.representative_virus_name != other.representative_virus_name
+        {
+            return Err(RvScreenError::validation(
+                "aggregate.virus_name",
+                format!(
+                    "accession candidate `{}` saw conflicting virus_name values: `{}` vs `{}`",
+                    self.accession_or_group,
+                    self.representative_virus_name,
+                    other.representative_virus_name
+                ),
+            ));
+        }
+
+        if self.level == AggregationLevel::VirusGroup
+            && self.representative_virus_name != other.representative_virus_name
+        {
+            self.mixed_virus_names = true;
+        }
+        self.mixed_virus_names |= other.mixed_virus_names;
+
+        self.accepted_fragments = self
+            .accepted_fragments
+            .saturating_add(other.accepted_fragments);
+        self.ambiguous_fragments = self
+            .ambiguous_fragments
+            .saturating_add(other.ambiguous_fragments);
+
+        for (contig, genome_length) in other.contig_lengths {
+            match self.contig_lengths.get(&contig) {
+                Some(existing) if *existing != genome_length => {
+                    return Err(RvScreenError::validation(
+                        "aggregate.genome_length",
+                        format!(
+                            "contig `{}` saw conflicting genome_length values: {} vs {}",
+                            contig, existing, genome_length
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.contig_lengths.insert(contig, genome_length);
+                }
+            }
+        }
+
+        for (contig, mut intervals) in other.intervals_by_contig {
+            self.intervals_by_contig
+                .entry(contig)
+                .or_default()
+                .append(&mut intervals);
+        }
+
         Ok(())
     }
 
@@ -459,6 +577,44 @@ mod tests {
         assert_eq!(calls[0].ambiguous_fragments, 1);
         assert_eq!(calls[0].nonoverlap_fragments, 0);
         assert_eq!(calls[0].evidence_strength, EvidenceStrength::Low);
+    }
+
+    #[test]
+    fn test_merge_from_combines_round_deltas_into_cumulative_candidate_state() {
+        let mut early_round = CandidateAggregator::new();
+        early_round
+            .add_fragment(
+                FragmentClass::Virus,
+                &virus_alignment("virus-d", "ACC-D", "adeno", 10_580, 500, 0, 90),
+            )
+            .expect("early representative delta should aggregate");
+
+        let mut later_round = CandidateAggregator::new();
+        later_round
+            .add_fragment(
+                FragmentClass::Virus,
+                &virus_alignment("virus-d", "ACC-D", "adeno", 10_580, 500, 200, 290),
+            )
+            .expect("later representative delta should aggregate");
+        later_round
+            .add_fragment(
+                FragmentClass::Ambiguous,
+                &ambiguous_alignment_same_candidate("virus-d", "ACC-D", "adeno", 10_580, 500),
+            )
+            .expect("later ambiguous representative delta should aggregate");
+
+        early_round
+            .merge_from(later_round)
+            .expect("round deltas should merge cleanly");
+        early_round.set_total_sampled_fragments(4);
+
+        let calls = early_round.finalize(&qc_stats(4));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].accepted_fragments, 2);
+        assert_eq!(calls[0].ambiguous_fragments, 1);
+        assert_eq!(calls[0].nonoverlap_fragments, 2);
+        assert!((calls[0].breadth - 0.36).abs() < 1e-9);
+        assert!((calls[0].raw_fraction - 0.5).abs() < 1e-9);
     }
 
     fn virus_alignment(

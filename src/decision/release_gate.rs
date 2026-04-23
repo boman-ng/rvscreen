@@ -2,7 +2,9 @@ use crate::calibration::{GateStatus, ReleaseGate as BenchmarkGates};
 use crate::cli::ScreenMode;
 use crate::decision::NegativeControlDecisionInput;
 use crate::error::{Result, RvScreenError};
-use crate::types::{ProfileToml, ReleaseStatus};
+use crate::types::{
+    CandidateRules, DecisionRules, FragmentRules, ProfileToml, ReleaseStatus, SamplingConfig,
+};
 use std::fs;
 use std::path::Path;
 
@@ -37,6 +39,23 @@ impl ReleaseGate {
 
         ReleaseStatus::Final
     }
+}
+
+pub fn expected_release_status(
+    sampling_mode: &str,
+    negative_control_required: bool,
+    negative_control: &NegativeControlDecisionInput,
+    benchmark_gates: Option<&BenchmarkGates>,
+    profile_status: &str,
+) -> Result<ReleaseStatus> {
+    let sampling_mode = parse_sampling_mode(sampling_mode)?;
+    let calibration_profile = synthetic_profile(negative_control_required, profile_status, sampling_mode);
+    Ok(ReleaseGate::evaluate(&ReleaseContext {
+        sampling_mode,
+        negative_control,
+        calibration_profile: &calibration_profile,
+        benchmark_gates,
+    }))
 }
 
 pub fn load_benchmark_gates(profile_dir: impl AsRef<Path>) -> Result<Option<BenchmarkGates>> {
@@ -95,6 +114,59 @@ fn benchmark_gate_blocked(context: &ReleaseContext) -> bool {
 
 fn gate_failed(status: &GateStatus) -> bool {
     *status == GateStatus::Fail
+}
+
+fn parse_sampling_mode(mode: &str) -> Result<ScreenMode> {
+    match mode {
+        "representative" => Ok(ScreenMode::Representative),
+        "streaming" => Ok(ScreenMode::Streaming),
+        other => Err(RvScreenError::validation(
+            "run_manifest.sampling_mode",
+            format!("unsupported sampling mode `{other}` in report bundle"),
+        )),
+    }
+}
+
+fn synthetic_profile(
+    negative_control_required: bool,
+    status: &str,
+    sampling_mode: ScreenMode,
+) -> ProfileToml {
+    ProfileToml {
+        profile_id: "audit-profile".to_string(),
+        status: status.to_string(),
+        reference_bundle: "audit-reference".to_string(),
+        backend: "minimap2".to_string(),
+        preset: "sr-conservative".to_string(),
+        seed: 0,
+        supported_input: vec!["fastq".to_string()],
+        supported_read_type: vec!["illumina_pe_shortread".to_string()],
+        negative_control_required,
+        sampling: SamplingConfig {
+            mode: match sampling_mode {
+                ScreenMode::Representative => "representative".to_string(),
+                ScreenMode::Streaming => "streaming".to_string(),
+            },
+            rounds: vec![1],
+            max_rounds: 1,
+        },
+        fragment_rules: FragmentRules {
+            min_mapq: 0,
+            min_as_diff: 0,
+            max_nm: 0,
+            require_pair_consistency: true,
+        },
+        candidate_rules: CandidateRules {
+            min_nonoverlap_fragments: 1,
+            min_breadth: 0.0,
+            max_background_ratio: 0.0,
+        },
+        decision_rules: DecisionRules {
+            theta_pos: 0.0,
+            theta_neg: 0.0,
+            allow_indeterminate: true,
+        },
+    }
 }
 
 #[cfg(test)]

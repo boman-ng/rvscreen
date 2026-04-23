@@ -1,23 +1,19 @@
-use crate::decision::SAMPLING_ONLY_CI_LABEL;
 use crate::error::{Result, RvScreenError};
+use crate::report::contract::{
+    sampling_only_ci_label, sampling_only_ci_label_violation, CANDIDATE_CALLS_TSV, CHECKSUM_SHA256,
+    COVERAGE_DIR, COVERAGE_HEADER, LOGS_DIR, ROUNDS_TSV, RUN_LOG, RUN_MANIFEST_JSON,
+    SAMPLE_SUMMARY_JSON,
+};
 use crate::types::{CandidateCall, DecisionStatus, RoundRecord, RunManifest, SampleSummary};
 use csv::WriterBuilder;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const SAMPLE_SUMMARY_JSON: &str = "sample_summary.json";
-const CANDIDATE_CALLS_TSV: &str = "candidate_calls.tsv";
-const RUN_MANIFEST_JSON: &str = "run_manifest.json";
-const ROUNDS_TSV: &str = "rounds.tsv";
-const COVERAGE_DIR: &str = "coverage";
-const LOGS_DIR: &str = "logs";
-const RUN_LOG: &str = "run.log";
-const COVERAGE_HEADER: &str = "position\tdepth\n";
-const FRACTION_CI_REASON_PREFIX: &str = "fraction_ci_95_label=";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReportWriter;
@@ -47,6 +43,11 @@ impl ReportWriter {
             output_dir,
             summary,
             candidates,
+        )?;
+        write_checksum_file(
+            &output_dir.join(CHECKSUM_SHA256),
+            output_dir,
+            &collect_report_bundle_files(output_dir)?,
         )?;
 
         Ok(())
@@ -111,12 +112,12 @@ fn validate_bundle_inputs(
     }
 
     for candidate in candidates {
-        if !candidate_has_sampling_only_ci_label(candidate) {
+        if let Some(violation) = sampling_only_ci_label_violation(&candidate.decision_reasons) {
             return Err(RvScreenError::validation(
                 "report.candidate_calls.fraction_ci_95",
                 format!(
-                    "candidate `{}` is missing the required sampling-only CI marker in decision_reasons",
-                    candidate.accession_or_group
+                    "candidate `{}` {violation}",
+                    candidate.accession_or_group,
                 ),
             ));
         }
@@ -316,6 +317,78 @@ fn create_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| RvScreenError::io(path, error))
 }
 
+fn collect_report_bundle_files(output_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    collect_report_bundle_files_recursive(output_dir, &mut files)?;
+    files.retain(|path| path.file_name().and_then(|name| name.to_str()) != Some(CHECKSUM_SHA256));
+    files.sort();
+    Ok(files)
+}
+
+fn collect_report_bundle_files_recursive(
+    current: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| RvScreenError::io(current, error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| RvScreenError::io(current, error))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_report_bundle_files_recursive(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_checksum_file(checksum_path: &Path, bundle_dir: &Path, files: &[std::path::PathBuf]) -> Result<()> {
+    let file = File::create(checksum_path).map_err(|error| RvScreenError::io(checksum_path, error))?;
+    let mut writer = BufWriter::new(file);
+
+    for path in files {
+        let digest = sha256_file(path)?;
+        let relative = path.strip_prefix(bundle_dir).map_err(|_| {
+            RvScreenError::validation(
+                "report.checksum",
+                format!(
+                    "`{}` is not inside `{}`",
+                    path.display(),
+                    bundle_dir.display()
+                ),
+            )
+        })?;
+        writeln!(writer, "{digest}  {}", relative.display())
+            .map_err(|error| RvScreenError::io(checksum_path, error))?;
+    }
+
+    writer.flush().map_err(|error| RvScreenError::io(checksum_path, error))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = File::open(path).map_err(|error| RvScreenError::io(path, error))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| RvScreenError::io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn json_string(value: &impl Serialize) -> Result<String> {
     serde_json::to_string(value)
         .map_err(|error| RvScreenError::validation("report.serialize", error.to_string()))
@@ -332,15 +405,8 @@ fn enum_label(value: &impl Serialize) -> Result<String> {
     })
 }
 
-fn candidate_has_sampling_only_ci_label(candidate: &CandidateCall) -> bool {
-    candidate_sampling_only_ci_label(candidate).is_some_and(|label| label == SAMPLING_ONLY_CI_LABEL)
-}
-
 fn candidate_sampling_only_ci_label(candidate: &CandidateCall) -> Option<&str> {
-    candidate
-        .decision_reasons
-        .iter()
-        .find_map(|reason| reason.strip_prefix(FRACTION_CI_REASON_PREFIX))
+    sampling_only_ci_label(&candidate.decision_reasons)
 }
 
 fn sanitize_file_component(value: &str) -> String {
@@ -369,6 +435,8 @@ fn unix_timestamp_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::SAMPLING_ONLY_CI_LABEL;
+    use crate::report::contract::FRACTION_CI_REASON_PREFIX;
     use crate::types::{ReleaseStatus, StopReason};
     use csv::ReaderBuilder;
     use std::collections::BTreeSet;
@@ -393,6 +461,7 @@ mod tests {
             files.iter().cloned().collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "candidate_calls.tsv".to_string(),
+                "checksum.sha256".to_string(),
                 "coverage/ebv.coverage.tsv".to_string(),
                 "logs/run.log".to_string(),
                 "rounds.tsv".to_string(),
@@ -553,6 +622,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_duplicate_fraction_ci_labels() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let output_dir = temp_dir.path().join("report_bundle");
+        let mut candidates = candidate_fixtures();
+        candidates[0]
+            .decision_reasons
+            .push(format!("{FRACTION_CI_REASON_PREFIX}{SAMPLING_ONLY_CI_LABEL}"));
+
+        let error = ReportWriter::write(
+            &output_dir,
+            &sample_summary_fixture(),
+            &candidates,
+            &round_fixtures(),
+            &run_manifest_fixture(),
+        )
+        .expect_err("duplicate CI labels should fail validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must carry exactly one `fraction_ci_95_label=...` marker"),
+            "{error}"
+        );
+    }
+
     fn collect_relative_paths(root: &Path) -> Vec<String> {
         let mut paths = Vec::new();
         collect_relative_paths_recursive(root, root, &mut paths);
@@ -604,6 +699,13 @@ mod tests {
             calibration_profile_version: "rvscreen_calib_2026.04.20-r1".into(),
             backend: "minimap2".into(),
             seed: 20_260_420,
+            sampling_mode: "representative".into(),
+            negative_control: crate::types::NegativeControlManifest {
+                required: false,
+                status: crate::types::NegativeControlStatus::Pass,
+                control_id: Some("neg-001".into()),
+                control_status: Some("pass".into()),
+            },
             input_files: vec!["reads_R1.fastq.gz".into(), "reads_R2.fastq.gz".into()],
         }
     }

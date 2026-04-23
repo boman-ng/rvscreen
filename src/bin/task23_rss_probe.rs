@@ -16,6 +16,8 @@ use testutil::{
 };
 
 const RSS_FRAGMENT_COUNT: usize = 32_000;
+const DEFAULT_RSS_PATH: &str = "target/criterion/task23_rss.tsv";
+const MAX_THREAD_BUDGET: usize = 16;
 
 fn main() -> io::Result<()> {
     let threads = std::env::args()
@@ -23,6 +25,12 @@ fn main() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing thread count arg"))?
         .parse::<usize>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    if threads == 0 || threads > MAX_THREAD_BUDGET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("thread count must be between 1 and {MAX_THREAD_BUDGET}"),
+        ));
+    }
 
     let fixture = ProbeFixture::new()?;
     let runner = fixture.prepared_runner(threads)?;
@@ -31,6 +39,7 @@ fn main() -> io::Result<()> {
         .run_without_report(&fixture.screen_args(threads, output_dir.clone()))
         .map_err(io_other)?;
     let rss_kb = current_rss_kb()?;
+    write_rss_evidence(threads, outcome.summary.sampled_fragments, rss_kb)?;
     eprintln!(
         "threads={threads}\tsampled_fragments={}\trss_kb={rss_kb}",
         outcome.summary.sampled_fragments
@@ -226,6 +235,21 @@ fn current_rss_kb() -> io::Result<u64> {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("VmRSS/VmHWM not found in /proc/self/status"))
+}
+
+fn write_rss_evidence(threads: usize, sampled_fragments: u64, rss_kb: u64) -> io::Result<()> {
+    let path = std::env::var_os("RVSCREEN_TASK23_RSS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RSS_PATH));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!(
+            "metric\tscenario\tthreads\tsampled_fragments\tvalue\tunit\npeak_rss\tparallel_screen_run\t{threads}\t{sampled_fragments}\t{rss_kb}\tKiB\n"
+        ),
+    )
 }
 
 fn io_other(error: impl ToString) -> io::Error {
