@@ -2,3 +2,12 @@ target/
 .local/
 .sisyphus/
 reference_bundle/
+.codex
+.codex/
+.ignore
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.log
