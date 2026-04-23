@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+const DEFAULT_THREAD_BUDGET: usize = 16;
+
 /// RVScreen — rapid, conservative, auditable viral signal detection in human sequencing data.
 #[derive(Parser)]
 #[command(name = "rvscreen", version, about, long_about = None)]
@@ -88,6 +90,7 @@ fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
+        .min(DEFAULT_THREAD_BUDGET)
 }
 
 /// Subcommands under `ref`.
@@ -146,4 +149,214 @@ pub struct AuditVerifyArgs {
     /// Optional calibration profile directory for version and release-status cross-checks.
     #[arg(long, value_name = "DIR")]
     pub calibration_profile: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn clap_contract_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_ref_build_contract() {
+        let cli = parse([
+            "rvscreen",
+            "ref",
+            "build",
+            "--host-fasta",
+            "host.fa",
+            "--virus-fasta",
+            "virus.fa",
+            "--decoy-fasta",
+            "decoy.fa",
+            "--manifest",
+            "manifest.json",
+            "--taxonomy",
+            "taxonomy.tsv",
+            "--out",
+            "reference-bundle",
+        ]);
+
+        let Commands::Ref { action } = cli.command else {
+            panic!("expected ref command");
+        };
+        let RefAction::Build(args) = action;
+
+        assert_eq!(args.host_fasta, PathBuf::from("host.fa"));
+        assert_eq!(args.virus_fasta, PathBuf::from("virus.fa"));
+        assert_eq!(args.decoy_fasta, Some(PathBuf::from("decoy.fa")));
+        assert_eq!(args.manifest, PathBuf::from("manifest.json"));
+        assert_eq!(args.taxonomy, PathBuf::from("taxonomy.tsv"));
+        assert_eq!(args.out, PathBuf::from("reference-bundle"));
+    }
+
+    #[test]
+    fn parses_calibrate_contract() {
+        let cli = parse([
+            "rvscreen",
+            "calibrate",
+            "--reference-bundle",
+            "reference-bundle",
+            "--benchmark-manifest",
+            "bench.yaml",
+            "--out",
+            "calibration-profile",
+        ]);
+
+        let Commands::Calibrate(args) = cli.command else {
+            panic!("expected calibrate command");
+        };
+
+        assert_eq!(args.reference_bundle, PathBuf::from("reference-bundle"));
+        assert_eq!(args.benchmark_manifest, PathBuf::from("bench.yaml"));
+        assert_eq!(args.out, PathBuf::from("calibration-profile"));
+    }
+
+    #[test]
+    fn parses_screen_contract_with_default_representative_mode() {
+        let cli = parse([
+            "rvscreen",
+            "screen",
+            "--input",
+            "reads_R1.fastq.gz",
+            "reads_R2.fastq.gz",
+            "--reference-bundle",
+            "reference-bundle",
+            "--calibration-profile",
+            "calibration-profile",
+            "--negative-control",
+            "negative-control.json",
+            "--out",
+            "report-bundle",
+        ]);
+
+        let Commands::Screen(args) = cli.command else {
+            panic!("expected screen command");
+        };
+
+        assert_eq!(
+            args.input,
+            vec![
+                PathBuf::from("reads_R1.fastq.gz"),
+                PathBuf::from("reads_R2.fastq.gz"),
+            ]
+        );
+        assert_eq!(args.reference_bundle, PathBuf::from("reference-bundle"));
+        assert_eq!(
+            args.calibration_profile,
+            PathBuf::from("calibration-profile")
+        );
+        assert_eq!(
+            args.negative_control,
+            Some(PathBuf::from("negative-control.json"))
+        );
+        assert_eq!(args.out, PathBuf::from("report-bundle"));
+        assert_eq!(args.mode, ScreenMode::Representative);
+        assert_eq!(args.threads, default_threads());
+    }
+
+    #[test]
+    fn screen_default_threads_respects_task9_thread_budget() {
+        assert!(default_threads() <= DEFAULT_THREAD_BUDGET);
+
+        let mut command = <ScreenArgs as clap::Args>::augment_args(clap::Command::new("screen"));
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .expect("screen help should render");
+        let help = String::from_utf8(help).expect("screen help should be UTF-8");
+
+        assert!(
+            help.contains(&format!("[default: {}]", default_threads())),
+            "screen help should advertise the clamped default thread count: {help}"
+        );
+    }
+
+    #[test]
+    fn parses_screen_contract_with_streaming_mode_and_threads() {
+        let cli = parse([
+            "rvscreen",
+            "screen",
+            "--input",
+            "reads.cram",
+            "--reference-bundle",
+            "reference-bundle",
+            "--calibration-profile",
+            "calibration-profile",
+            "--out",
+            "report-bundle",
+            "--mode",
+            "streaming",
+            "--threads",
+            "4",
+        ]);
+
+        let Commands::Screen(args) = cli.command else {
+            panic!("expected screen command");
+        };
+
+        assert_eq!(args.input, vec![PathBuf::from("reads.cram")]);
+        assert_eq!(args.mode, ScreenMode::Streaming);
+        assert_eq!(args.threads, 4);
+    }
+
+    #[test]
+    fn parses_audit_verify_contract() {
+        let cli = parse([
+            "rvscreen",
+            "audit",
+            "verify",
+            "--report-bundle",
+            "report-bundle",
+            "--reference-bundle",
+            "reference-bundle",
+            "--calibration-profile",
+            "calibration-profile",
+        ]);
+
+        let Commands::Audit { action } = cli.command else {
+            panic!("expected audit command");
+        };
+        let AuditAction::Verify(args) = action;
+
+        assert_eq!(args.report_bundle, PathBuf::from("report-bundle"));
+        assert_eq!(
+            args.reference_bundle,
+            Some(PathBuf::from("reference-bundle"))
+        );
+        assert_eq!(
+            args.calibration_profile,
+            Some(PathBuf::from("calibration-profile"))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_command_family() {
+        let error = match Cli::try_parse_from(["rvscreen", "report"]) {
+            Ok(_) => panic!("unsupported command family should be rejected"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("CLI help should render");
+        let help = String::from_utf8(help).expect("CLI help should be UTF-8");
+
+        assert!(rendered.contains("unrecognized subcommand 'report'"), "{rendered}");
+        assert!(help.contains("ref"), "{help}");
+        assert!(help.contains("calibrate"), "{help}");
+        assert!(help.contains("screen"), "{help}");
+        assert!(help.contains("audit"), "{help}");
+    }
+
+    fn parse(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Cli {
+        Cli::try_parse_from(args).expect("CLI arguments should parse")
+    }
 }

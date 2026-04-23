@@ -1,21 +1,23 @@
+use super::spool::RepresentativeRoundSpool;
 use crate::adjudicate::{AdjudicationInputs, FragmentAdjudicator};
 use crate::aggregate::CandidateAggregator;
 use crate::align::{CompetitiveAligner, FragmentAlignResult};
 use crate::error::{Result, RvScreenError};
 use crate::io::FragmentRecord as IoFragmentRecord;
 use crate::types::FragmentClass;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
-    Arc, Mutex,
+    mpsc::{Receiver, SyncSender, sync_channel},
+    Arc, Condvar, Mutex,
 };
 use std::thread::{self, ScopedJoinHandle};
 
 const FRAGMENTS_PER_THREAD: usize = 64;
 const MIN_ALIGNMENT_BATCH_SIZE: usize = 64;
 const MAX_ALIGNMENT_BATCH_SIZE: usize = 1024;
+const MAX_EXECUTOR_THREADS: usize = 16;
 
 pub(crate) struct RoundParallelism {
     threads: usize,
@@ -23,6 +25,17 @@ pub(crate) struct RoundParallelism {
 }
 
 struct ProcessedFragment {
+    class: FragmentClass,
+    align_result: FragmentAlignResult,
+}
+
+struct RepresentativeSubmission {
+    entry_round: usize,
+    fragment: IoFragmentRecord,
+}
+
+struct RepresentativeProcessedFragment {
+    entry_round: usize,
     class: FragmentClass,
     align_result: FragmentAlignResult,
 }
@@ -37,15 +50,27 @@ struct SharedFailure {
     first_message: Mutex<Option<String>>,
 }
 
+struct WorkQueue<T> {
+    state: Mutex<WorkQueueState<T>>,
+    submit_ready: Condvar,
+    worker_ready: Vec<Condvar>,
+}
+
+struct WorkQueueState<T> {
+    queues: Vec<VecDeque<Sequenced<T>>>,
+    capacities: Vec<usize>,
+    next_worker: usize,
+    closed: bool,
+    cancelled: bool,
+}
+
 struct OrderedExecutor<'scope, In, Out, SinkState>
 where
     In: Send + 'scope,
     Out: Send + 'scope,
     SinkState: Send + 'scope,
 {
-    work_tx: Option<SyncSender<Sequenced<In>>>,
-    submit_permit_tx: SyncSender<()>,
-    submit_permit_rx: Receiver<()>,
+    work_queue: Arc<WorkQueue<In>>,
     worker_handles: Vec<ScopedJoinHandle<'scope, Result<()>>>,
     sink_handle: Option<ScopedJoinHandle<'scope, Result<SinkState>>>,
     failure: Arc<SharedFailure>,
@@ -54,6 +79,15 @@ where
 
 pub(crate) struct RoundExecutor<'scope> {
     inner: OrderedExecutor<'scope, IoFragmentRecord, ProcessedFragment, CandidateAggregator>,
+}
+
+pub(crate) struct RepresentativeRoundExecutor<'scope> {
+    inner: OrderedExecutor<
+        'scope,
+        RepresentativeSubmission,
+        RepresentativeProcessedFragment,
+        RepresentativeRoundSpool,
+    >,
 }
 
 impl RoundParallelism {
@@ -66,9 +100,13 @@ impl RoundParallelism {
         }
 
         Ok(Self {
-            threads: requested_threads,
-            batch_size: batch_size_for(requested_threads),
+            threads: requested_threads.min(MAX_EXECUTOR_THREADS),
+            batch_size: batch_size_for(requested_threads.min(MAX_EXECUTOR_THREADS)),
         })
+    }
+
+    pub(crate) fn threads(&self) -> usize {
+        self.threads
     }
 
     pub(crate) fn start_round_executor<'scope>(
@@ -93,6 +131,34 @@ impl RoundParallelism {
 
         RoundExecutor { inner }
     }
+
+    pub(crate) fn start_representative_round_executor<'scope>(
+        &self,
+        scope: &'scope thread::Scope<'scope, '_>,
+        aligner: &'scope CompetitiveAligner,
+        adjudicator: &'scope FragmentAdjudicator,
+        spool: RepresentativeRoundSpool,
+    ) -> RepresentativeRoundExecutor<'scope> {
+        let work_capacity = self.batch_size;
+        let result_capacity = self.batch_size;
+        let inner = OrderedExecutor::new(
+            scope,
+            self.threads,
+            work_capacity,
+            result_capacity,
+            move |submission| process_representative_fragment(submission, aligner, adjudicator),
+            spool,
+            |spool, processed| {
+                spool.record_processed_fragment(
+                    processed.entry_round,
+                    processed.class,
+                    &processed.align_result,
+                )
+            },
+        );
+
+        RepresentativeRoundExecutor { inner }
+    }
 }
 
 impl<'scope> RoundExecutor<'scope> {
@@ -101,6 +167,27 @@ impl<'scope> RoundExecutor<'scope> {
     }
 
     pub(crate) fn finish(self) -> Result<CandidateAggregator> {
+        self.inner.finish()
+    }
+}
+
+impl<'scope> RepresentativeRoundExecutor<'scope> {
+    pub(crate) fn submit(
+        &self,
+        sequence: usize,
+        entry_round: usize,
+        fragment: IoFragmentRecord,
+    ) -> Result<()> {
+        self.inner.submit(
+            sequence,
+            RepresentativeSubmission {
+                entry_round,
+                fragment,
+            },
+        )
+    }
+
+    pub(crate) fn finish(self) -> Result<RepresentativeRoundSpool> {
         self.inner.finish()
     }
 }
@@ -145,6 +232,131 @@ impl SharedFailure {
     }
 }
 
+impl<T> WorkQueue<T> {
+    fn new(worker_count: usize, total_capacity: usize) -> Self {
+        let capacities = distribute_work_capacity(worker_count.max(1), total_capacity.max(1));
+        let queues = capacities
+            .iter()
+            .map(|capacity| VecDeque::with_capacity(*capacity))
+            .collect();
+        let worker_ready = (0..worker_count.max(1))
+            .map(|_| Condvar::new())
+            .collect();
+
+        Self {
+            state: Mutex::new(WorkQueueState {
+                queues,
+                capacities,
+                next_worker: 0,
+                closed: false,
+                cancelled: false,
+            }),
+            submit_ready: Condvar::new(),
+            worker_ready,
+        }
+    }
+
+    fn submit(&self, item: Sequenced<T>, failure: &SharedFailure) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            if state.cancelled || failure.is_cancelled() {
+                return Err(failure.stage_error(
+                    "bounded topology submission aborted",
+                    "downstream stage reported a failure while the work queue was full",
+                ));
+            }
+
+            if state.closed {
+                return Err(failure.stage_error(
+                    "bounded topology channel closed",
+                    "work queue disconnected before submission completed",
+                ));
+            }
+
+            if let Some(worker_index) = next_available_worker(&state) {
+                state.queues[worker_index].push_back(item);
+                state.next_worker = (worker_index + 1) % state.queues.len();
+                drop(state);
+                self.worker_ready[worker_index].notify_one();
+                return Ok(());
+            }
+
+            state = self
+                .submit_ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn recv(&self, worker_index: usize) -> Option<Sequenced<T>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        loop {
+            if state.cancelled {
+                return None;
+            }
+
+            if let Some(item) = state.queues[worker_index].pop_front() {
+                drop(state);
+                self.submit_ready.notify_one();
+                return Some(item);
+            }
+
+            if state.closed {
+                return None;
+            }
+
+            state = self.worker_ready[worker_index]
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return;
+        }
+        state.closed = true;
+        drop(state);
+        self.submit_ready.notify_all();
+        self.notify_workers();
+    }
+
+    fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.cancelled {
+            return;
+        }
+        state.cancelled = true;
+        for queue in &mut state.queues {
+            queue.clear();
+        }
+        drop(state);
+        self.submit_ready.notify_all();
+        self.notify_workers();
+    }
+
+    fn notify_workers(&self) {
+        for worker_ready in &self.worker_ready {
+            worker_ready.notify_all();
+        }
+    }
+}
+
 impl<'scope, In, Out, SinkState> OrderedExecutor<'scope, In, Out, SinkState>
 where
     In: Send + 'scope,
@@ -164,48 +376,39 @@ where
         WorkerFn: Fn(In) -> Result<Out> + Send + Sync + 'scope,
         AggregateFn: Fn(&mut SinkState, Out) -> Result<()> + Send + Sync + 'scope,
     {
-        let (work_tx, work_rx) = sync_channel(work_capacity.max(1));
+        let worker_count = threads.clamp(1, MAX_EXECUTOR_THREADS);
+        let work_queue = Arc::new(WorkQueue::new(worker_count, work_capacity));
         let (result_tx, result_rx) = sync_channel(result_capacity.max(1));
-        let max_in_flight = work_capacity.max(1) + result_capacity.max(1) + threads.max(1);
-        let (submit_permit_tx, submit_permit_rx) = sync_channel(max_in_flight);
-        for _ in 0..max_in_flight {
-            submit_permit_tx
-                .send(())
-                .expect("fresh submit-permit channel should accept its initial capacity");
-        }
         let failure = Arc::new(SharedFailure::new());
-        let shared_work_rx = Arc::new(Mutex::new(work_rx));
         let worker_fn = Arc::new(worker_fn);
         let aggregate_fn = Arc::new(aggregate_fn);
 
-        let mut worker_handles = Vec::with_capacity(threads.max(1));
-        for _ in 0..threads.max(1) {
-            let work_rx = Arc::clone(&shared_work_rx);
+        let mut worker_handles = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let work_queue = Arc::clone(&work_queue);
             let result_tx = result_tx.clone();
             let worker_fn = Arc::clone(&worker_fn);
             let failure = Arc::clone(&failure);
             worker_handles.push(scope.spawn(move || {
-                worker_loop(work_rx, result_tx, worker_fn, failure)
+                worker_loop(worker_index, work_queue, result_tx, worker_fn, failure)
             }));
         }
         drop(result_tx);
 
-        let submit_permit_for_sink = submit_permit_tx.clone();
+        let work_queue_for_sink = Arc::clone(&work_queue);
         let failure_for_sink = Arc::clone(&failure);
         let sink_handle = scope.spawn(move || {
             sink_loop(
                 result_rx,
                 sink_state,
                 aggregate_fn,
-                submit_permit_for_sink,
+                work_queue_for_sink,
                 failure_for_sink,
             )
         });
 
         Self {
-            work_tx: Some(work_tx),
-            submit_permit_tx,
-            submit_permit_rx,
+            work_queue,
             worker_handles,
             sink_handle: Some(sink_handle),
             failure,
@@ -214,37 +417,27 @@ where
     }
 
     fn submit(&self, sequence: usize, payload: In) -> Result<()> {
-        acquire_submit_permit(&self.submit_permit_rx, self.failure.as_ref())?;
-        let work_tx = self
-            .work_tx
-            .as_ref()
-            .expect("ordered executor submit called after finish");
-        if let Err(error) = send_with_backpressure(
-            work_tx,
+        self.work_queue.submit(
             Sequenced { sequence, payload },
-            "work queue disconnected before submission completed",
-            &self.failure,
-        ) {
-            restore_submit_permit(&self.submit_permit_tx, self.failure.as_ref())?;
-            return Err(error);
-        }
-
-        Ok(())
+            self.failure.as_ref(),
+        )
     }
 
     fn finish(mut self) -> Result<SinkState> {
-        drop(self.work_tx.take());
+        self.work_queue.close();
 
         let mut first_error = None;
-        for handle in self.worker_handles {
+        for handle in std::mem::take(&mut self.worker_handles) {
             match handle.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
+                    self.work_queue.cancel();
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
                 Err(_) => {
+                    self.work_queue.cancel();
                     if first_error.is_none() {
                         first_error = Some(RvScreenError::validation(
                             "pipeline.parallel",
@@ -277,6 +470,17 @@ where
     }
 }
 
+impl<'scope, In, Out, SinkState> Drop for OrderedExecutor<'scope, In, Out, SinkState>
+where
+    In: Send + 'scope,
+    Out: Send + 'scope,
+    SinkState: Send + 'scope,
+{
+    fn drop(&mut self) {
+        self.work_queue.cancel();
+    }
+}
+
 fn process_fragment(
     fragment: IoFragmentRecord,
     aligner: &CompetitiveAligner,
@@ -291,14 +495,51 @@ fn process_fragment(
     })
 }
 
+fn process_representative_fragment(
+    submission: RepresentativeSubmission,
+    aligner: &CompetitiveAligner,
+    adjudicator: &FragmentAdjudicator,
+) -> Result<RepresentativeProcessedFragment> {
+    let processed = process_fragment(submission.fragment, aligner, adjudicator)?;
+
+    Ok(RepresentativeProcessedFragment {
+        entry_round: submission.entry_round,
+        class: processed.class,
+        align_result: processed.align_result,
+    })
+}
+
 fn batch_size_for(threads: usize) -> usize {
     threads
         .saturating_mul(FRAGMENTS_PER_THREAD)
         .clamp(MIN_ALIGNMENT_BATCH_SIZE, MAX_ALIGNMENT_BATCH_SIZE)
 }
 
+fn distribute_work_capacity(worker_count: usize, total_capacity: usize) -> Vec<usize> {
+    let worker_count = worker_count.max(1);
+    let total_capacity = total_capacity.max(1);
+    let base_capacity = total_capacity / worker_count;
+    let remainder = total_capacity % worker_count;
+
+    (0..worker_count)
+        .map(|worker_index| base_capacity + usize::from(worker_index < remainder))
+        .collect()
+}
+
+fn next_available_worker<T>(state: &WorkQueueState<T>) -> Option<usize> {
+    for offset in 0..state.queues.len() {
+        let worker_index = (state.next_worker + offset) % state.queues.len();
+        if state.queues[worker_index].len() < state.capacities[worker_index] {
+            return Some(worker_index);
+        }
+    }
+
+    None
+}
+
 fn worker_loop<In, Out, WorkerFn>(
-    work_rx: Arc<Mutex<Receiver<Sequenced<In>>>>,
+    worker_index: usize,
+    work_queue: Arc<WorkQueue<In>>,
     result_tx: SyncSender<Sequenced<Out>>,
     worker_fn: Arc<WorkerFn>,
     failure: Arc<SharedFailure>,
@@ -308,23 +549,12 @@ where
     Out: Send,
     WorkerFn: Fn(In) -> Result<Out> + Send + Sync,
 {
-    loop {
-        let work_item = {
-            let receiver = work_rx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            receiver.recv()
-        };
-
-        let work_item = match work_item {
-            Ok(work_item) => work_item,
-            Err(_) => return Ok(()),
-        };
-
+    while let Some(work_item) = work_queue.recv(worker_index) {
         let output = match worker_fn(work_item.payload) {
             Ok(output) => output,
             Err(error) => {
                 failure.record(&error);
+                work_queue.cancel();
                 return Err(error);
             }
         };
@@ -333,26 +563,30 @@ where
             sequence: work_item.sequence,
             payload: output,
         };
-        if let Err(error) = send_with_backpressure(
+        if let Err(error) = send_result(
             &result_tx,
             result_item,
             "result queue disconnected before worker result could be emitted",
-            &failure,
+            failure.as_ref(),
         ) {
             failure.record(&error);
+            work_queue.cancel();
             return Err(error);
         }
     }
+
+    Ok(())
 }
 
-fn sink_loop<Out, SinkState, AggregateFn>(
+fn sink_loop<In, Out, SinkState, AggregateFn>(
     result_rx: Receiver<Sequenced<Out>>,
     mut sink_state: SinkState,
     aggregate_fn: Arc<AggregateFn>,
-    submit_permit_tx: SyncSender<()>,
+    work_queue: Arc<WorkQueue<In>>,
     failure: Arc<SharedFailure>,
 ) -> Result<SinkState>
 where
+    In: Send,
     Out: Send,
     SinkState: Send,
     AggregateFn: Fn(&mut SinkState, Out) -> Result<()> + Send + Sync,
@@ -370,19 +604,23 @@ where
                 ),
             );
             failure.record(&error);
+            work_queue.cancel();
             return Err(error);
         }
-        drain_pending_results(
+        if let Err(error) = drain_pending_results(
             &mut pending,
             &mut next_sequence,
             &mut sink_state,
             aggregate_fn.as_ref(),
-            &submit_permit_tx,
             failure.as_ref(),
-        )?;
+        ) {
+            work_queue.cancel();
+            return Err(error);
+        }
     }
 
     if failure.is_cancelled() {
+        work_queue.cancel();
         return Err(failure.stage_error(
             "aggregation sink terminated after downstream cancellation",
             "round pipeline did not complete cleanly",
@@ -398,6 +636,7 @@ where
             ),
         );
         failure.record(&error);
+        work_queue.cancel();
         return Err(error);
     }
 
@@ -409,80 +648,31 @@ fn drain_pending_results<Out, SinkState, AggregateFn>(
     next_sequence: &mut usize,
     sink_state: &mut SinkState,
     aggregate_fn: &AggregateFn,
-    submit_permit_tx: &SyncSender<()>,
     failure: &SharedFailure,
 ) -> Result<()>
 where
     AggregateFn: Fn(&mut SinkState, Out) -> Result<()>,
 {
-    while let Some(item) = pending.remove(&*next_sequence) {
+    while let Some(item) = pending.remove(next_sequence) {
         if let Err(error) = aggregate_fn(sink_state, item) {
             failure.record(&error);
             return Err(error);
         }
-        restore_submit_permit(submit_permit_tx, failure)?;
         *next_sequence = next_sequence.saturating_add(1);
     }
 
     Ok(())
 }
 
-fn acquire_submit_permit(receiver: &Receiver<()>, failure: &SharedFailure) -> Result<()> {
-    loop {
-        match receiver.try_recv() {
-            Ok(()) => return Ok(()),
-            Err(TryRecvError::Empty) => {
-                if failure.is_cancelled() {
-                    return Err(failure.stage_error(
-                        "bounded topology submit window closed",
-                        "downstream stage reported a failure while waiting for aggregation capacity",
-                    ));
-                }
-                thread::yield_now();
-            }
-            Err(TryRecvError::Disconnected) => {
-                return Err(failure.stage_error(
-                    "submit permit channel closed",
-                    "aggregation sink stopped issuing capacity permits",
-                ));
-            }
-        }
-    }
-}
-
-fn restore_submit_permit(sender: &SyncSender<()>, failure: &SharedFailure) -> Result<()> {
-    sender.send(()).map_err(|_| {
-        failure.stage_error(
-            "submit permit release failed",
-            "aggregation sink dropped the capacity channel unexpectedly",
-        )
-    })
-}
-
-fn send_with_backpressure<T>(
+fn send_result<T>(
     sender: &SyncSender<Sequenced<T>>,
-    mut item: Sequenced<T>,
+    item: Sequenced<T>,
     disconnected_reason: &str,
-    failure: &Arc<SharedFailure>,
+    failure: &SharedFailure,
 ) -> Result<()> {
-    loop {
-        match sender.try_send(item) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Full(returned)) => {
-                if failure.is_cancelled() {
-                    return Err(failure.stage_error(
-                        "bounded topology submission aborted",
-                        "downstream stage reported a failure while the queue was full",
-                    ));
-                }
-                item = returned;
-                thread::yield_now();
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(failure.stage_error("bounded topology channel closed", disconnected_reason));
-            }
-        }
-    }
+    sender.send(item).map_err(|_| {
+        failure.stage_error("bounded topology channel closed", disconnected_reason)
+    })
 }
 
 #[cfg(test)]
@@ -562,5 +752,126 @@ mod tests {
                 .expect("release helper thread should not panic");
             assert_eq!(seen, vec![0, 1, 2]);
         });
+    }
+
+    #[test]
+    fn ordered_executor_preserves_submission_order_across_worker_reordering() {
+        thread::scope(|scope| {
+            let executor = OrderedExecutor::new(
+                scope,
+                4,
+                4,
+                1,
+                |value: usize| {
+                    let delay_ms = ((8usize.saturating_sub(value)) * 10) as u64;
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    Ok(value)
+                },
+                Vec::new(),
+                |seen: &mut Vec<usize>, value| {
+                    seen.push(value);
+                    Ok(())
+                },
+            );
+
+            for value in 0..8 {
+                executor
+                    .submit(value, value)
+                    .expect("executor should accept ordered work");
+            }
+
+            let seen = executor.finish().expect("executor should finish cleanly");
+            assert_eq!(seen, (0..8).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn ordered_executor_unblocks_submitter_after_worker_failure() {
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        thread::scope(|scope| {
+            let release_rx = Arc::clone(&release_rx);
+            let executor = OrderedExecutor::new(
+                scope,
+                1,
+                1,
+                1,
+                move |value: usize| {
+                    if value == 0 {
+                        started_tx
+                            .send(())
+                            .expect("worker should signal when it starts processing");
+                        let receiver = release_rx
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        receiver
+                            .recv()
+                            .expect("worker release signal should arrive before failure");
+                        return Err(RvScreenError::validation(
+                            "pipeline.parallel",
+                            "intentional worker failure",
+                        ));
+                    }
+                    Ok(value)
+                },
+                Vec::new(),
+                |seen: &mut Vec<usize>, value| {
+                    seen.push(value);
+                    Ok(())
+                },
+            );
+
+            executor
+                .submit(0, 0)
+                .expect("first item should enter the topology");
+            executor
+                .submit(1, 1)
+                .expect("second item should occupy the only queued slot");
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker should start processing the failing item");
+
+            let release_handle = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                release_tx
+                    .send(())
+                    .expect("release signal should unblock the failing worker");
+            });
+
+            let started_wait = Instant::now();
+            let submit_error = executor
+                .submit(2, 2)
+                .expect_err("blocked submit should return once worker failure cancels the queue");
+            assert!(
+                started_wait.elapsed() >= Duration::from_millis(100),
+                "blocked submit should wait until the worker failure is observed"
+            );
+            assert!(
+                submit_error.to_string().contains("intentional worker failure"),
+                "submit error should include the original worker failure: {submit_error}"
+            );
+
+            let finish_error = executor
+                .finish()
+                .expect_err("finish should surface the worker failure");
+            assert!(
+                finish_error.to_string().contains("intentional worker failure"),
+                "finish error should include the original worker failure: {finish_error}"
+            );
+
+            release_handle
+                .join()
+                .expect("release helper thread should not panic");
+        });
+    }
+
+    #[test]
+    fn round_parallelism_clamps_executor_threads_to_thread_budget() {
+        let parallelism = RoundParallelism::new(MAX_EXECUTOR_THREADS + 8)
+            .expect("parallelism should clamp oversized thread requests");
+
+        assert_eq!(parallelism.threads, MAX_EXECUTOR_THREADS);
     }
 }

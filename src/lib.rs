@@ -1,6 +1,7 @@
 #[cfg(test)]
 extern crate self as rvscreen;
 
+pub mod architecture;
 pub mod adjudicate;
 pub mod aggregate;
 pub mod align;

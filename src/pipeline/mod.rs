@@ -1,5 +1,7 @@
 mod parallel;
+mod spool;
 
+use crate::align::competitive::resolve_bundle_inputs;
 use crate::adjudicate::FragmentAdjudicator;
 use crate::aggregate::CandidateAggregator;
 use crate::align::{CompetitiveAligner, CompetitivePreset};
@@ -14,18 +16,19 @@ use crate::decision::{
 };
 use crate::error::{Result, RvScreenError};
 use crate::io::{
-    BamFragmentReader, CramFragmentReader, FastqPairReader, FragmentRecord as IoFragmentRecord,
+    FragmentReaderFactory, FragmentRecord as IoFragmentRecord, ScreenInput,
 };
 use crate::pipeline::parallel::RoundParallelism;
+use crate::pipeline::spool::RepresentativeRoundSpool;
 use crate::qc::{FragmentRecord as QcFragmentRecord, QcFilter, QcStats};
-use crate::report::ReportWriter;
-use crate::sampling::{RepresentativeSampler, RoundManager, Sampler, StreamingSampler};
+use crate::report::write_report_bundle;
+use crate::sampling::{RepresentativeSampler, Sampler, StreamingSampler};
 use crate::types::{CandidateCall, RoundRecord, RunManifest, SampleSummary, StopReason};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const SUPPORTED_BACKEND: &str = "minimap2";
 const SUPPORTED_PRESET: &str = "sr-conservative";
-const COMPOSITE_FASTA: &str = "composite.fa";
+const MAX_ACTIVE_SAMPLING_ROUNDS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScreenRunOutcome {
@@ -39,12 +42,13 @@ pub struct PreparedScreenRunner {
     loaded_bundle: LoadedReferenceBundle,
     loaded_profile: LoadedProfile,
     benchmark_gates: Option<CalibrationReleaseGate>,
-    input: InputSpec,
+    input: ScreenInput,
     round_targets: Vec<u64>,
     qc_filter: QcFilter,
     adjudicator: FragmentAdjudicator,
     decision_engine: DecisionEngine,
     aligner: CompetitiveAligner,
+    thread_budget: usize,
 }
 
 pub fn run_screen(args: &ScreenArgs) -> Result<ScreenRunOutcome> {
@@ -58,7 +62,7 @@ impl PreparedScreenRunner {
         let benchmark_gates = load_benchmark_gates(&loaded_profile.profile_dir)?;
         validate_profile_compatibility(&loaded_bundle, &loaded_profile.profile)?;
 
-        let input = InputSpec::from_cli_inputs(&args.input, &loaded_bundle)?;
+        let input = ScreenInput::from_cli_inputs(&args.input, &loaded_bundle.bundle_dir)?;
         validate_supported_input(&loaded_profile.profile.supported_input, input.kind_label())?;
 
         let round_targets = active_round_targets(
@@ -71,11 +75,14 @@ impl PreparedScreenRunner {
             &loaded_profile.profile.decision_rules,
             &loaded_profile.profile.candidate_rules,
         );
-        let aligner = CompetitiveAligner::new_with_threads(
-            &args.reference_bundle,
+        let (reference_input, manifest_path) = resolve_bundle_inputs(&loaded_bundle.bundle_dir)?;
+        let aligner = CompetitiveAligner::from_resolved_inputs(
+            reference_input,
+            manifest_path,
             CompetitivePreset::SrConservative,
             args.threads,
         )?;
+        let thread_budget = aligner.thread_budget();
 
         Ok(Self {
             loaded_bundle,
@@ -87,6 +94,7 @@ impl PreparedScreenRunner {
             adjudicator,
             decision_engine,
             aligner,
+            thread_budget,
         })
     }
 
@@ -98,10 +106,28 @@ impl PreparedScreenRunner {
         self.execute(args, false)
     }
 
+    pub fn aligner_reference_input(&self) -> &std::path::Path {
+        self.aligner.reference_input()
+    }
+
+    pub fn aligner_uses_prebuilt_index(&self) -> bool {
+        self.aligner.uses_prebuilt_index()
+    }
+
     fn execute(&self, args: &ScreenArgs, write_report: bool) -> Result<ScreenRunOutcome> {
         let negative_control =
             NegativeControlDecisionInput::from_optional_path(args.negative_control.as_deref())?;
         let parallelism = RoundParallelism::new(args.threads)?;
+        if parallelism.threads() != self.thread_budget {
+            return Err(RvScreenError::validation(
+                "threads",
+                format!(
+                    "prepared screen runner was initialized for {} worker threads, but execution requested {}",
+                    self.thread_budget,
+                    parallelism.threads()
+                ),
+            ));
+        }
         let round_dependencies = RoundDependencies {
             qc_filter: &self.qc_filter,
             aligner: &self.aligner,
@@ -148,6 +174,12 @@ impl PreparedScreenRunner {
             calibration_profile_version: self.loaded_profile.profile.profile_id.clone(),
             backend: self.loaded_profile.profile.backend.clone(),
             seed: self.loaded_profile.profile.seed,
+            sampling_mode: match args.mode {
+                ScreenMode::Representative => "representative".to_string(),
+                ScreenMode::Streaming => "streaming".to_string(),
+            },
+            negative_control: negative_control
+                .manifest(self.loaded_profile.profile.negative_control_required),
             input_files: args
                 .input
                 .iter()
@@ -156,7 +188,7 @@ impl PreparedScreenRunner {
         };
 
         if write_report {
-            ReportWriter::write(
+            write_report_bundle(
                 &args.out,
                 &summary,
                 &execution.candidates,
@@ -171,96 +203,6 @@ impl PreparedScreenRunner {
             rounds: execution.rounds,
             manifest,
         })
-    }
-}
-
-#[derive(Debug, Clone)]
-enum InputSpec {
-    FastqPair {
-        r1: PathBuf,
-        r2: PathBuf,
-    },
-    Bam {
-        path: PathBuf,
-    },
-    Cram {
-        path: PathBuf,
-        reference_fasta: PathBuf,
-    },
-}
-
-impl InputSpec {
-    fn from_cli_inputs(inputs: &[PathBuf], bundle: &LoadedReferenceBundle) -> Result<Self> {
-        match inputs {
-            [r1, r2] => {
-                if !is_fastq_like(r1) || !is_fastq_like(r2) {
-                    return Err(RvScreenError::validation(
-                        "input",
-                        format!(
-                            "two-input mode currently supports only paired FASTQ files; got `{}` and `{}`",
-                            r1.display(),
-                            r2.display()
-                        ),
-                    ));
-                }
-
-                Ok(Self::FastqPair {
-                    r1: r1.clone(),
-                    r2: r2.clone(),
-                })
-            }
-            [path] if is_bam_like(path) => Ok(Self::Bam { path: path.clone() }),
-            [path] if is_cram_like(path) => Ok(Self::Cram {
-                path: path.clone(),
-                reference_fasta: bundle.bundle_dir.join(COMPOSITE_FASTA),
-            }),
-            [path] if is_fastq_like(path) => Err(RvScreenError::validation(
-                "input",
-                format!(
-                    "single-file interleaved FASTQ input `{}` is not yet wired in Task 18; provide two paired FASTQ files, one BAM/uBAM, or one CRAM",
-                    path.display()
-                ),
-            )),
-            [path] => Err(RvScreenError::validation(
-                "input",
-                format!(
-                    "unsupported single input `{}`; supported inputs are paired FASTQ, BAM/uBAM, or CRAM",
-                    path.display()
-                ),
-            )),
-            [] => Err(RvScreenError::validation(
-                "input",
-                "at least one input file is required",
-            )),
-            _ => Err(RvScreenError::validation(
-                "input",
-                "screen currently accepts exactly two paired FASTQs or exactly one BAM/uBAM/CRAM input",
-            )),
-        }
-    }
-
-    fn open_reader(&self) -> Result<Box<dyn Iterator<Item = Result<IoFragmentRecord>>>> {
-        match self {
-            Self::FastqPair { r1, r2 } => Ok(Box::new(FastqPairReader::open(r1, r2)?)),
-            Self::Bam { path } => Ok(Box::new(BamFragmentReader::open(path)?)),
-            Self::Cram {
-                path,
-                reference_fasta,
-            } => Ok(Box::new(CramFragmentReader::open(
-                path,
-                Some(reference_fasta),
-            )?)),
-        }
-    }
-
-    fn kind_label(&self) -> &'static str {
-        match self {
-            Self::FastqPair { r1, .. } if is_gzip_path(r1) => "fastq.gz",
-            Self::FastqPair { .. } => "fastq",
-            Self::Bam { path } if is_ubam_like(path) => "ubam",
-            Self::Bam { .. } => "bam",
-            Self::Cram { .. } => "cram",
-        }
     }
 }
 
@@ -281,33 +223,9 @@ struct RoundExecution {
     candidates: Vec<CandidateCall>,
 }
 
-enum RoundSampling<'a> {
-    Representative {
-        sampler: &'a RepresentativeSampler,
-        round_index: usize,
-    },
-    Streaming {
-        sampler: &'a StreamingSampler,
-    },
-}
-
-impl RoundSampling<'_> {
-    fn should_accept(&self, fragment_key: &str, qc_passing_index: usize) -> bool {
-        match self {
-            Self::Representative {
-                sampler,
-                round_index,
-            } => sampler.should_accept(fragment_key, *round_index),
-            Self::Streaming { sampler } => sampler.should_accept(fragment_key, qc_passing_index),
-        }
-    }
-
-    fn sampled_limit(&self) -> Option<u64> {
-        match self {
-            Self::Representative { .. } => None,
-            Self::Streaming { sampler } => Some(sampler.max_fragments() as u64),
-        }
-    }
+struct RepresentativePassExecution {
+    qc_stats: QcStats,
+    round_spool: RepresentativeRoundSpool,
 }
 
 struct RoundDependencies<'a> {
@@ -320,33 +238,58 @@ struct RoundDependencies<'a> {
 }
 
 fn execute_representative_rounds(
-    input: &InputSpec,
+    input: &dyn FragmentReaderFactory,
     seed: &u64,
     round_targets: &[u64],
     dependencies: &RoundDependencies<'_>,
 ) -> Result<PipelineExecution> {
     let sampler = RepresentativeSampler::new(*seed, round_targets.to_vec())?;
-    let mut round_manager = RoundManager::new(round_targets.to_vec())?;
-    let mut qc_baseline = None;
+
+    if sampler.round_count() == 1 {
+        let execution = execute_single_round_representative_pass(input, &sampler, dependencies)?;
+        let background_adjusted =
+            apply_negative_control(&execution.candidates, dependencies.negative_control);
+        let evaluated = dependencies
+            .decision_engine
+            .evaluate_candidates(&background_adjusted);
+        let outcome = dependencies.decision_engine.decide(
+            &evaluated,
+            &DecisionContext::new(1, 1),
+        );
+        let rounds = vec![round_record(&evaluated, execution.sampled_fragments, &outcome)];
+
+        return Ok(PipelineExecution {
+            qc_stats: execution.qc_stats,
+            final_round_sampled_fragments: execution.sampled_fragments,
+            stop_reason: outcome
+                .stop_reason
+                .clone()
+                .unwrap_or(StopReason::MaxRoundsReached),
+            final_outcome: outcome,
+            candidates: evaluated,
+            rounds,
+        });
+    }
+
+    let RepresentativePassExecution {
+        qc_stats,
+        round_spool,
+    } = execute_representative_pass(input, &sampler, dependencies)?;
+    let mut cumulative_aggregator = CandidateAggregator::new();
+    let mut cumulative_sampled_fragments = 0u64;
     let mut final_candidates = Vec::new();
     let mut rounds = Vec::new();
     let mut final_outcome = None;
 
-    while round_manager.advance_round().is_some() {
-        let round_index = round_manager
-            .current_round()
-            .expect("round manager should expose current round after advance");
-        let execution = execute_round(
-            input,
-            RoundSampling::Representative {
-                sampler: &sampler,
-                round_index,
-            },
-            dependencies,
-        )?;
-        let qc_stats = merge_or_validate_qc_baseline(&mut qc_baseline, execution.qc_stats)?;
+    for (round_index, contribution) in round_spool.into_round_contributions().into_iter().enumerate() {
+        cumulative_sampled_fragments = cumulative_sampled_fragments
+            .saturating_add(contribution.sampled_fragments);
+        cumulative_aggregator.merge_from(contribution.aggregator)?;
+        cumulative_aggregator.set_total_sampled_fragments(cumulative_sampled_fragments);
+
+        let round_candidates = cumulative_aggregator.finalize(&qc_stats);
         let background_adjusted =
-            apply_negative_control(&execution.candidates, dependencies.negative_control);
+            apply_negative_control(&round_candidates, dependencies.negative_control);
         let evaluated = dependencies
             .decision_engine
             .evaluate_candidates(&background_adjusted);
@@ -356,17 +299,16 @@ fn execute_representative_rounds(
         );
         rounds.push(round_record(
             &evaluated,
-            execution.sampled_fragments,
+            cumulative_sampled_fragments,
             &outcome,
         ));
         final_candidates = evaluated;
         final_outcome = Some(outcome.clone());
-        round_manager.mark_current_round_complete();
 
         if outcome.should_stop() {
             return Ok(PipelineExecution {
                 qc_stats,
-                final_round_sampled_fragments: execution.sampled_fragments,
+                final_round_sampled_fragments: cumulative_sampled_fragments,
                 stop_reason: outcome
                     .stop_reason
                     .clone()
@@ -382,7 +324,7 @@ fn execute_representative_rounds(
         RvScreenError::validation("sampling.rounds", "no representative rounds were executed")
     })?;
     Ok(PipelineExecution {
-        qc_stats: qc_baseline.unwrap_or_default(),
+        qc_stats,
         final_round_sampled_fragments: rounds
             .last()
             .map(|round| round.sampled_fragments)
@@ -398,7 +340,7 @@ fn execute_representative_rounds(
 }
 
 fn execute_streaming_rounds(
-    input: &InputSpec,
+    input: &dyn FragmentReaderFactory,
     round_targets: &[u64],
     dependencies: &RoundDependencies<'_>,
 ) -> Result<PipelineExecution> {
@@ -415,11 +357,7 @@ fn execute_streaming_rounds(
             )
         })?;
         let sampler = StreamingSampler::new(max_fragments);
-        let execution = execute_round(
-            input,
-            RoundSampling::Streaming { sampler: &sampler },
-            dependencies,
-        )?;
+        let execution = execute_round(input, &sampler, dependencies)?;
         let qc_stats = merge_or_validate_qc_baseline(&mut qc_baseline, execution.qc_stats)?;
         let background_adjusted =
             apply_negative_control(&execution.candidates, dependencies.negative_control);
@@ -473,8 +411,8 @@ fn execute_streaming_rounds(
 }
 
 fn execute_round(
-    input: &InputSpec,
-    sampling: RoundSampling<'_>,
+    input: &dyn FragmentReaderFactory,
+    sampler: &StreamingSampler,
     dependencies: &RoundDependencies<'_>,
 ) -> Result<RoundExecution> {
     let reader = input.open_reader()?;
@@ -500,7 +438,7 @@ fn execute_round(
                 continue;
             }
 
-            let should_accept = sampling.should_accept(&fragment.fragment_key, qc_passing_index);
+            let should_accept = sampler.should_accept(&fragment.fragment_key, qc_passing_index);
             qc_passing_index = qc_passing_index.saturating_add(1);
             if !should_accept {
                 continue;
@@ -510,12 +448,103 @@ fn execute_round(
             executor.submit(submission_sequence, fragment)?;
             submission_sequence = submission_sequence.saturating_add(1);
 
-            if sampling
-                .sampled_limit()
-                .is_some_and(|limit| sampled_fragments >= limit)
-            {
+            if sampled_fragments >= sampler.max_fragments() as u64 {
                 break;
             }
+        }
+
+        executor.finish()
+    })?;
+
+    aggregator.set_total_sampled_fragments(sampled_fragments);
+    let candidates = aggregator.finalize(&qc_stats);
+
+    Ok(RoundExecution {
+        qc_stats,
+        sampled_fragments,
+        candidates,
+    })
+}
+
+fn execute_representative_pass(
+    input: &dyn FragmentReaderFactory,
+    sampler: &RepresentativeSampler,
+    dependencies: &RoundDependencies<'_>,
+) -> Result<RepresentativePassExecution> {
+    let reader = input.open_reader()?;
+    let mut qc_stats = QcStats::default();
+    let mut submission_sequence = 0usize;
+
+    let round_spool = std::thread::scope(|scope| -> Result<RepresentativeRoundSpool> {
+        let executor = dependencies.parallelism.start_representative_round_executor(
+            scope,
+            dependencies.aligner,
+            dependencies.adjudicator,
+            RepresentativeRoundSpool::new(sampler.round_count())?,
+        );
+
+        for fragment in reader {
+            let fragment = fragment?;
+            let qc_fragment = bridge_qc_fragment(&fragment);
+            let qc_result = dependencies
+                .qc_filter
+                .filter_and_record(&qc_fragment, &mut qc_stats);
+            if !qc_result.is_pass() {
+                continue;
+            }
+
+            let bucket = sampler.bucket_for(&fragment.fragment_key);
+            let Some(entry_round) = sampler.entry_round_for_bucket(bucket) else {
+                continue;
+            };
+
+            executor.submit(submission_sequence, entry_round, fragment)?;
+            submission_sequence = submission_sequence.saturating_add(1);
+        }
+
+        executor.finish()
+    })?;
+
+    Ok(RepresentativePassExecution {
+        qc_stats,
+        round_spool,
+    })
+}
+
+fn execute_single_round_representative_pass(
+    input: &dyn FragmentReaderFactory,
+    sampler: &RepresentativeSampler,
+    dependencies: &RoundDependencies<'_>,
+) -> Result<RoundExecution> {
+    let reader = input.open_reader()?;
+    let mut qc_stats = QcStats::default();
+    let mut sampled_fragments = 0u64;
+    let mut submission_sequence = 0usize;
+
+    let mut aggregator = std::thread::scope(|scope| -> Result<CandidateAggregator> {
+        let executor = dependencies.parallelism.start_round_executor(
+            scope,
+            dependencies.aligner,
+            dependencies.adjudicator,
+        );
+
+        for fragment in reader {
+            let fragment = fragment?;
+            let qc_fragment = bridge_qc_fragment(&fragment);
+            let qc_result = dependencies
+                .qc_filter
+                .filter_and_record(&qc_fragment, &mut qc_stats);
+            if !qc_result.is_pass() {
+                continue;
+            }
+
+            if !sampler.should_accept(&fragment.fragment_key, 0) {
+                continue;
+            }
+
+            sampled_fragments = sampled_fragments.saturating_add(1);
+            executor.submit(submission_sequence, fragment)?;
+            submission_sequence = submission_sequence.saturating_add(1);
         }
 
         executor.finish()
@@ -609,6 +638,16 @@ fn active_round_targets(rounds: &[u64], max_rounds: u64) -> Result<Vec<u64>> {
         ));
     }
 
+    if active.len() > MAX_ACTIVE_SAMPLING_ROUNDS {
+        return Err(RvScreenError::validation(
+            "sampling.max_rounds",
+            format!(
+                "screen supports at most {MAX_ACTIVE_SAMPLING_ROUNDS} active sampling rounds per run; got {}",
+                active.len()
+            ),
+        ));
+    }
+
     Ok(active)
 }
 
@@ -659,10 +698,16 @@ mod testutil;
 mod tests {
     use super::testutil;
     use super::*;
+    use crate::io::{FastqPairReader, FragmentStream};
     use crate::reference::{build_reference_bundle, BuildReferenceBundleRequest};
     use crate::types::{BundleManifest, ContigEntry};
     use std::fs;
     use std::io;
+    use std::path::Path;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::tempdir;
 
     use testutil::{
@@ -772,6 +817,214 @@ mod tests {
                 Some(expected) => assert_eq!(expected, &outcome),
                 None => baseline = Some(outcome),
             }
+        }
+    }
+
+    #[test]
+    fn representative_mode_opens_input_only_once_per_run() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bundle =
+            prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+        let calibration_dir = write_calibration_profile(
+            tempdir.path().join("calibration"),
+            &bundle.version,
+            false,
+            0.0,
+        )
+        .expect("calibration profile should be written");
+        let (r1, r2) = generate_fastq_pair(
+            &FastqPairConfig::new(240, 100, 4819)
+                .with_output_dir(tempdir.path().join("fastq"))
+                .with_components(vec![
+                    ReadComponent::new(SyntheticSource::Human, 0.92),
+                    ReadComponent::new(
+                        SyntheticSource::Virus(VirusSelector::Accession(
+                            "NC_SYNTHV1.1".to_string(),
+                        )),
+                        0.08,
+                    ),
+                ]),
+        )
+        .expect("FASTQ should be generated");
+        let args = ScreenArgs {
+            input: vec![r1.clone(), r2.clone()],
+            reference_bundle: bundle.bundle_dir,
+            calibration_profile: calibration_dir,
+            negative_control: None,
+            out: tempdir.path().join("report"),
+            mode: ScreenMode::Representative,
+            threads: 2,
+        };
+        let prepared =
+            PreparedScreenRunner::prepare(&args).expect("screen runner should prepare cleanly");
+        let fragments = FastqPairReader::open(&r1, &r2)
+            .expect("FASTQ reader should open")
+            .collect::<Result<Vec<_>>>()
+            .expect("FASTQ fragments should collect");
+        let input = CountingInput::new(fragments);
+        let negative_control = NegativeControlDecisionInput::from_optional_path(None)
+            .expect("negative control should be optional");
+        let parallelism = RoundParallelism::new(args.threads)
+            .expect("parallelism should respect configured threads");
+        let dependencies = RoundDependencies {
+            qc_filter: &prepared.qc_filter,
+            aligner: &prepared.aligner,
+            adjudicator: &prepared.adjudicator,
+            decision_engine: &prepared.decision_engine,
+            negative_control: &negative_control,
+            parallelism: &parallelism,
+        };
+
+        let outcome = execute_representative_rounds(
+            &input,
+            &prepared.loaded_profile.profile.seed,
+            &prepared.round_targets,
+            &dependencies,
+        )
+        .expect("single-pass representative execution should succeed");
+
+        assert_eq!(input.open_count(), 1);
+        assert!(!outcome.rounds.is_empty());
+    }
+
+    #[test]
+    fn prepare_prefers_prebuilt_mmi_and_normalizes_thread_budget_once() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bundle =
+            prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+        let calibration_dir = write_calibration_profile(
+            tempdir.path().join("calibration"),
+            &bundle.version,
+            false,
+            0.0,
+        )
+        .expect("calibration profile should be written");
+        let (r1, r2) = generate_fastq_pair(
+            &FastqPairConfig::new(24, 100, 8821)
+                .with_output_dir(tempdir.path().join("fastq"))
+                .with_components(vec![
+                    ReadComponent::new(SyntheticSource::Human, 0.92),
+                    ReadComponent::new(
+                        SyntheticSource::Virus(VirusSelector::Accession(
+                            "NC_SYNTHV1.1".to_string(),
+                        )),
+                        0.08,
+                    ),
+                ]),
+        )
+        .expect("FASTQ should be generated");
+
+        let prepared = PreparedScreenRunner::prepare(&ScreenArgs {
+            input: vec![r1, r2],
+            reference_bundle: bundle.bundle_dir,
+            calibration_profile: calibration_dir,
+            negative_control: None,
+            out: tempdir.path().join("report"),
+            mode: ScreenMode::Representative,
+            threads: 64,
+        })
+        .expect("screen runner should prepare cleanly");
+
+        assert!(prepared.aligner.uses_prebuilt_index());
+        assert!(prepared
+            .aligner
+            .reference_input()
+            .ends_with("index/minimap2/composite.mmi"));
+        assert_eq!(prepared.thread_budget, 16);
+        assert_eq!(prepared.aligner.thread_budget(), prepared.thread_budget);
+    }
+
+    #[test]
+    fn prepared_runner_reuses_aligner_across_multiple_runs() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bundle =
+            prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+        let calibration_dir = write_calibration_profile(
+            tempdir.path().join("calibration"),
+            &bundle.version,
+            false,
+            0.0,
+        )
+        .expect("calibration profile should be written");
+        let (r1, r2) = generate_fastq_pair(
+            &FastqPairConfig::new(128, 100, 7713)
+                .with_output_dir(tempdir.path().join("fastq"))
+                .with_components(vec![
+                    ReadComponent::new(SyntheticSource::Human, 0.95),
+                    ReadComponent::new(
+                        SyntheticSource::Virus(VirusSelector::Accession(
+                            "NC_SYNTHV1.1".to_string(),
+                        )),
+                        0.05,
+                    ),
+                ]),
+        )
+        .expect("FASTQ should be generated");
+        let args = ScreenArgs {
+            input: vec![r1, r2],
+            reference_bundle: bundle.bundle_dir,
+            calibration_profile: calibration_dir,
+            negative_control: None,
+            out: tempdir.path().join("report-first"),
+            mode: ScreenMode::Representative,
+            threads: 4,
+        };
+        let prepared =
+            PreparedScreenRunner::prepare(&args).expect("screen runner should prepare cleanly");
+        let shared_aligner_id = prepared.aligner.shared_instance_id();
+
+        let first = prepared
+            .run_without_report(&args)
+            .expect("first prepared run should succeed");
+        let mut second_args = args.clone();
+        second_args.out = tempdir.path().join("report-second");
+        let second = prepared
+            .run_without_report(&second_args)
+            .expect("second prepared run should reuse the same aligner");
+
+        assert_eq!(prepared.aligner.shared_instance_id(), shared_aligner_id);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn sampling_round_count_is_bounded_before_coordinator_allocation() {
+        let rounds = (1..=65).collect::<Vec<u64>>();
+
+        let error = active_round_targets(&rounds, rounds.len() as u64)
+            .expect_err("too many active rounds should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("supports at most 64 active sampling rounds"));
+    }
+
+    #[derive(Clone)]
+    struct CountingInput {
+        fragments: Vec<IoFragmentRecord>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl CountingInput {
+        fn new(fragments: Vec<IoFragmentRecord>) -> Self {
+            Self {
+                fragments,
+                opens: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn open_count(&self) -> usize {
+            self.opens.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FragmentReaderFactory for CountingInput {
+        fn open_reader(&self) -> Result<FragmentStream> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(self.fragments.clone().into_iter().map(Ok)))
+        }
+
+        fn kind_label(&self) -> &'static str {
+            "fastq"
         }
     }
 
@@ -938,33 +1191,4 @@ fn normalize_sample_name(file_name: &str) -> String {
     }
 
     value
-}
-
-fn is_fastq_like(path: &Path) -> bool {
-    let path = path.to_string_lossy().to_ascii_lowercase();
-    path.ends_with(".fastq")
-        || path.ends_with(".fq")
-        || path.ends_with(".fastq.gz")
-        || path.ends_with(".fq.gz")
-}
-
-fn is_bam_like(path: &Path) -> bool {
-    let path = path.to_string_lossy().to_ascii_lowercase();
-    path.ends_with(".bam") || path.ends_with(".ubam")
-}
-
-fn is_ubam_like(path: &Path) -> bool {
-    path.to_string_lossy()
-        .to_ascii_lowercase()
-        .ends_with(".ubam")
-}
-
-fn is_cram_like(path: &Path) -> bool {
-    path.to_string_lossy()
-        .to_ascii_lowercase()
-        .ends_with(".cram")
-}
-
-fn is_gzip_path(path: &Path) -> bool {
-    path.to_string_lossy().to_ascii_lowercase().ends_with(".gz")
 }

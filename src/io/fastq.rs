@@ -1,3 +1,4 @@
+pub use super::FragmentRecord;
 use crate::error::{Result, RvScreenError};
 use flate2::read::MultiGzDecoder;
 use seq_io::fastq::{Error as FastqError, Reader, Record};
@@ -6,15 +7,6 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 const FASTQ_RECORD_LINES: u64 = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FragmentRecord {
-    pub fragment_key: String,
-    pub r1_seq: Vec<u8>,
-    pub r1_qual: Vec<u8>,
-    pub r2_seq: Vec<u8>,
-    pub r2_qual: Vec<u8>,
-}
 
 pub struct FastqPairReader {
     r1_path: PathBuf,
@@ -124,13 +116,13 @@ fn build_fragment_record(
         ));
     }
 
-    Ok(FragmentRecord {
-        fragment_key: r1_key,
-        r1_seq: r1.seq().to_vec(),
-        r1_qual: r1.qual().to_vec(),
-        r2_seq: r2.seq().to_vec(),
-        r2_qual: r2.qual().to_vec(),
-    })
+    Ok(FragmentRecord::new(
+        r1_key,
+        r1.seq().to_vec(),
+        decode_fastq_quality_scores(r1.qual())?,
+        r2.seq().to_vec(),
+        decode_fastq_quality_scores(r2.qual())?,
+    ))
 }
 
 fn orphan_error(
@@ -167,6 +159,23 @@ fn is_gzip_path(path: &Path) -> bool {
 
 fn header_text(record: &impl Record) -> String {
     String::from_utf8_lossy(record.head()).into_owned()
+}
+
+fn decode_fastq_quality_scores(qualities: &[u8]) -> Result<Vec<u8>> {
+    qualities
+        .iter()
+        .copied()
+        .map(decode_fastq_quality_score)
+        .collect()
+}
+
+fn decode_fastq_quality_score(symbol: u8) -> Result<u8> {
+    symbol.checked_sub(33).ok_or_else(|| {
+        RvScreenError::validation(
+            "input",
+            format!("FASTQ quality byte {symbol} is below Phred+33 encoding range"),
+        )
+    })
 }
 
 fn fastq_record_line(pair_index: u64) -> u64 {
@@ -220,6 +229,8 @@ mod tests {
             assert_eq!(record.r2_seq.len(), 75);
             assert_eq!(record.r1_qual.len(), 75);
             assert_eq!(record.r2_qual.len(), 75);
+            assert!(record.r1_qual.iter().all(|score| *score <= 93));
+            assert!(record.r2_qual.iter().all(|score| *score <= 93));
             pair_count += 1;
         }
 
@@ -385,6 +396,25 @@ mod tests {
 
         let records = read_all_pairs(&r1_gz, &r2_gz).expect("gzip FASTQ pair should read cleanly");
         assert_eq!(records.len(), 8);
+    }
+
+    #[test]
+    fn test_decodes_fastq_qualities_to_phred_scores() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let r1_path = tempdir.path().join("r1.fastq");
+        let r2_path = tempdir.path().join("r2.fastq");
+
+        fs::write(&r1_path, "@read/1\nACGT\n+\n?@AB\n").expect("R1 FASTQ should be written");
+        fs::write(&r2_path, "@read/2\nTGCA\n+\nBCDE\n").expect("R2 FASTQ should be written");
+
+        let record = FastqPairReader::open(&r1_path, &r2_path)
+            .expect("reader should open")
+            .next_pair()
+            .expect("pair should exist")
+            .expect("pair should decode");
+
+        assert_eq!(record.r1_qual, vec![30, 31, 32, 33]);
+        assert_eq!(record.r2_qual, vec![33, 34, 35, 36]);
     }
 
     fn read_all_pairs(r1_path: &Path, r2_path: &Path) -> Result<Vec<FragmentRecord>> {

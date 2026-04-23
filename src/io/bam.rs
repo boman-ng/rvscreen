@@ -1,16 +1,36 @@
-use super::fastq::{normalize_qname, FragmentRecord};
+use super::fastq::normalize_qname;
+use super::fragment_reader::{
+    build_name_sorted_fragment_record, mate_slot_from_flags, orphaned_name_sorted_record_error,
+    FragmentMateRecord,
+};
+use super::FragmentRecord;
 use crate::error::{Result, RvScreenError};
 use noodles::bam;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const BAM_MAGIC_NUMBER: [u8; 4] = *b"BAM\x01";
 
-#[derive(Debug)]
 pub struct BamFragmentReader {
-    buffered_pairs: VecDeque<FragmentRecord>,
+    path: PathBuf,
+    reader: bam::io::Reader<Box<dyn Read>>,
+    record: bam::Record,
+    pending_mate: Option<FragmentMateRecord>,
+    record_number: u64,
+    exhausted: bool,
+}
+
+impl std::fmt::Debug for BamFragmentReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BamFragmentReader")
+            .field("path", &self.path)
+            .field("record", &self.record)
+            .field("pending_mate", &self.pending_mate)
+            .field("record_number", &self.record_number)
+            .field("exhausted", &self.exhausted)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BamFragmentReader {
@@ -19,19 +39,68 @@ impl BamFragmentReader {
         P: AsRef<Path>,
     {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).map_err(|source| RvScreenError::io(&path, source))?;
-        let mut reader = bam::io::Reader::new(file);
+        let mut reader = open_bam_reader(&path)?;
         let raw_header = read_raw_bam_header(&mut reader, &path)?;
 
         reject_coordinate_sorted_input(&path, &raw_header)?;
 
-        let buffered_pairs = decode_all_pairs(&path, &mut reader)?;
-
-        Ok(Self { buffered_pairs })
+        Ok(Self {
+            path,
+            reader,
+            record: bam::Record::default(),
+            pending_mate: None,
+            record_number: 0,
+            exhausted: false,
+        })
     }
 
     pub fn next_pair(&mut self) -> Option<Result<FragmentRecord>> {
-        self.buffered_pairs.pop_front().map(Ok)
+        if self.exhausted {
+            return None;
+        }
+
+        loop {
+            match self.read_next_mate() {
+                Ok(Some(mate)) => {
+                    if let Some(first) = self.pending_mate.take() {
+                        let fragment = match build_fragment_record(&self.path, &first, &mate) {
+                            Ok(fragment) => fragment,
+                            Err(err) => {
+                                self.exhausted = true;
+                                return Some(Err(err));
+                            }
+                        };
+
+                        return Some(Ok(fragment));
+                    }
+
+                    self.pending_mate = Some(mate);
+                }
+                Ok(None) => {
+                    self.exhausted = true;
+
+                    return self
+                        .pending_mate
+                        .take()
+                        .map(|orphan| Err(orphan_bam_record_error(&self.path, &orphan)));
+                }
+                Err(err) => {
+                    self.exhausted = true;
+                    return Some(Err(err));
+                }
+            }
+        }
+    }
+
+    fn read_next_mate(&mut self) -> Result<Option<FragmentMateRecord>> {
+        match self.reader.read_record(&mut self.record) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                self.record_number = self.record_number.saturating_add(1);
+                extract_mate_record(&self.path, self.record_number, &self.record).map(Some)
+            }
+            Err(source) => Err(RvScreenError::io(&self.path, source)),
+        }
     }
 }
 
@@ -41,15 +110,6 @@ impl Iterator for BamFragmentReader {
     fn next(&mut self) -> Option<Self::Item> {
         self.next_pair()
     }
-}
-
-#[derive(Debug, Clone)]
-struct MateRecord {
-    record_number: u64,
-    qname: String,
-    fragment_key: String,
-    seq: Vec<u8>,
-    qual: Vec<u8>,
 }
 
 fn read_raw_bam_header<R>(reader: &mut bam::io::Reader<R>, path: &Path) -> Result<String>
@@ -86,32 +146,10 @@ where
     Ok(raw_header)
 }
 
-fn decode_all_pairs<R>(
-    path: &Path,
-    reader: &mut bam::io::Reader<R>,
-) -> Result<VecDeque<FragmentRecord>>
-where
-    R: Read,
-{
-    let mut buffered_pairs = VecDeque::new();
-    let mut pending_mate = None;
-
-    for (index, result) in reader.records().enumerate() {
-        let record = result.map_err(|source| RvScreenError::io(path, source))?;
-        let mate = extract_mate_record(path, index as u64 + 1, &record)?;
-
-        if let Some(first) = pending_mate.take() {
-            buffered_pairs.push_back(build_fragment_record(path, &first, &mate)?);
-        } else {
-            pending_mate = Some(mate);
-        }
-    }
-
-    if let Some(orphan) = pending_mate {
-        return Err(orphan_bam_record_error(path, &orphan));
-    }
-
-    Ok(buffered_pairs)
+fn open_bam_reader(path: &Path) -> Result<bam::io::Reader<Box<dyn Read>>> {
+    let file = File::open(path).map_err(|source| RvScreenError::io(path, source))?;
+    let decoder: Box<dyn Read> = Box::new(bam::io::Reader::new(file).into_inner());
+    Ok(bam::io::Reader::from(decoder))
 }
 
 fn reject_coordinate_sorted_input(path: &Path, raw_header: &str) -> Result<()> {
@@ -139,7 +177,7 @@ fn extract_mate_record(
     path: &Path,
     record_number: u64,
     record: &bam::Record,
-) -> Result<MateRecord> {
+) -> Result<FragmentMateRecord> {
     let qname = record
         .name()
         .map(|name| String::from_utf8_lossy(name.as_ref()).into_owned())
@@ -151,59 +189,39 @@ fn extract_mate_record(
             )
         })?;
 
-    Ok(MateRecord {
+    let fragment_key = normalize_qname(&qname);
+
+    Ok(FragmentMateRecord::new(
         record_number,
-        fragment_key: normalize_qname(&qname),
         qname,
-        seq: record.sequence().iter().collect(),
-        qual: record.quality_scores().iter().collect(),
-    })
+        fragment_key,
+        record.sequence().iter().collect(),
+        record.quality_scores().iter().collect(),
+        mate_slot_from_flags(record.flags()),
+    ))
 }
 
 fn build_fragment_record(
     path: &Path,
-    first: &MateRecord,
-    second: &MateRecord,
+    first: &FragmentMateRecord,
+    second: &FragmentMateRecord,
 ) -> Result<FragmentRecord> {
-    if first.fragment_key != second.fragment_key {
-        return Err(RvScreenError::parse(
-            path,
-            first.record_number,
-            format!(
-                "adjacent BAM records are not a name-sorted pair: record {} `{}` -> `{}`, record {} `{}` -> `{}`",
-                first.record_number,
-                first.qname,
-                first.fragment_key,
-                second.record_number,
-                second.qname,
-                second.fragment_key,
-            ),
-        ));
-    }
-
-    Ok(FragmentRecord {
-        fragment_key: first.fragment_key.clone(),
-        r1_seq: first.seq.clone(),
-        r1_qual: first.qual.clone(),
-        r2_seq: second.seq.clone(),
-        r2_qual: second.qual.clone(),
-    })
+    build_name_sorted_fragment_record(path, "BAM", first, second)
 }
 
-fn orphan_bam_record_error(path: &Path, orphan: &MateRecord) -> RvScreenError {
-    RvScreenError::parse(
+fn orphan_bam_record_error(path: &Path, orphan: &FragmentMateRecord) -> RvScreenError {
+    orphaned_name_sorted_record_error(
         path,
-        orphan.record_number,
-        format!(
-            "orphaned BAM record {} `{}`: adjacent mate is missing; provide name-sorted BAM/uBAM input",
-            orphan.record_number, orphan.qname,
-        ),
+        "BAM",
+        orphan,
+        "provide name-sorted BAM/uBAM input",
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noodles::sam;
     use std::fs;
     use std::io::{self, Write};
     use tempfile::tempdir;
@@ -325,17 +343,179 @@ mod tests {
         assert_eq!(record.r2_seq, b"TTTT");
     }
 
+    #[test]
+    fn test_streaming_reader_defers_orphan_detection_until_iteration() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bam_path = tempdir.path().join("orphan-late.bam");
+
+        write_test_bam(
+            &bam_path,
+            "queryname",
+            &[
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"ACGT", &[30, 31, 32, 33]),
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"TGCA", &[34, 35, 36, 37]),
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1001:2001", b"GGTT", &[20, 21, 22, 23]),
+            ],
+        )
+        .expect("BAM fixture should be written");
+
+        let mut reader = BamFragmentReader::open(&bam_path)
+            .expect("reader should open without preloading the whole BAM");
+
+        let first = reader
+            .next_pair()
+            .expect("first pair should be available")
+            .expect("first pair should decode");
+        assert_eq!(first.fragment_key, "READ:1:FCX123:1:1101:1000:2000");
+
+        let err = reader
+            .next_pair()
+            .expect("orphan should surface when iteration reaches EOF")
+            .expect_err("orphaned BAM record should fail");
+
+        match err {
+            RvScreenError::ParseError { line, reason, .. } => {
+                assert_eq!(line, 3);
+                assert!(reason.contains("orphaned BAM record 3"));
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+
+        assert!(reader.next_pair().is_none());
+    }
+
+    #[test]
+    fn test_streaming_reader_reports_non_adjacent_pair_mismatch() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bam_path = tempdir.path().join("mismatch-late.bam");
+
+        write_test_bam(
+            &bam_path,
+            "queryname",
+            &[
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"ACGT", &[30, 31, 32, 33]),
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"TGCA", &[34, 35, 36, 37]),
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1001:2001", b"GGTT", &[20, 21, 22, 23]),
+                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1002:2002", b"AACC", &[24, 25, 26, 27]),
+            ],
+        )
+        .expect("BAM fixture should be written");
+
+        let mut reader = BamFragmentReader::open(&bam_path)
+            .expect("reader should open without pre-validating later records");
+
+        let first = reader
+            .next_pair()
+            .expect("first pair should be available")
+            .expect("first pair should decode");
+        assert_eq!(first.fragment_key, "READ:1:FCX123:1:1101:1000:2000");
+
+        let err = reader
+            .next_pair()
+            .expect("mismatched adjacent pair should surface during iteration")
+            .expect_err("mismatched fragment keys must fail");
+
+        match err {
+            RvScreenError::ParseError { line, reason, .. } => {
+                assert_eq!(line, 3);
+                assert!(reason.contains("adjacent BAM records are not a name-sorted pair"));
+                assert!(reason.contains("1001:2001"));
+                assert!(reason.contains("1002:2002"));
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+
+        assert!(reader.next_pair().is_none());
+    }
+
+    #[test]
+    fn test_streaming_reader_orders_flagged_mates_into_r1_r2_slots() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let bam_path = tempdir.path().join("slot-ordered.bam");
+
+        write_test_bam(
+            &bam_path,
+            "queryname",
+            &[
+                SyntheticBamRecord::last(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"TGCA",
+                    &[34, 35, 36, 37],
+                ),
+                SyntheticBamRecord::first(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"ACGT",
+                    &[30, 31, 32, 33],
+                ),
+            ],
+        )
+        .expect("BAM fixture should be written");
+
+        let record = BamFragmentReader::open(&bam_path)
+            .expect("reader should open BAM")
+            .next_pair()
+            .expect("pair should be available")
+            .expect("pair should decode");
+
+        assert_eq!(record.r1_seq, b"ACGT");
+        assert_eq!(record.r1_qual, vec![30, 31, 32, 33]);
+        assert_eq!(record.r2_seq, b"TGCA");
+        assert_eq!(record.r2_qual, vec![34, 35, 36, 37]);
+    }
+
     #[derive(Debug, Clone)]
     struct SyntheticBamRecord {
         qname: String,
+        flags: sam::alignment::record::Flags,
         sequence: Vec<u8>,
         quality_scores: Vec<u8>,
     }
 
     impl SyntheticBamRecord {
         fn new(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::with_flags(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn first(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::with_flags(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::FIRST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn last(qname: &str, sequence: &[u8], quality_scores: &[u8]) -> Self {
+            Self::with_flags(
+                qname,
+                sam::alignment::record::Flags::SEGMENTED
+                    | sam::alignment::record::Flags::UNMAPPED
+                    | sam::alignment::record::Flags::MATE_UNMAPPED
+                    | sam::alignment::record::Flags::LAST_SEGMENT,
+                sequence,
+                quality_scores,
+            )
+        }
+
+        fn with_flags(
+            qname: &str,
+            flags: sam::alignment::record::Flags,
+            sequence: &[u8],
+            quality_scores: &[u8],
+        ) -> Self {
             Self {
                 qname: qname.to_owned(),
+                flags,
                 sequence: sequence.to_vec(),
                 quality_scores: quality_scores.to_vec(),
             }
@@ -385,7 +565,7 @@ mod tests {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let bin_mq_nl =
             u32::from(read_name_len) | (u32::from(255u8) << 8) | (u32::from(4680u16) << 16);
-        let flags = 0x01u16 | 0x04u16 | 0x08u16;
+        let flags = u16::from(record.flags);
         let flag_nc = u32::from(flags) << 16;
         let packed_sequence = pack_sequence(&record.sequence)?;
 
