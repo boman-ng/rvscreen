@@ -369,6 +369,30 @@ mod tests {
             .any(|reason| reason == "negative_control_background_fraction_absent"));
     }
 
+    #[test]
+    fn negative_control_background_ratio_uses_unique_fraction_domain() {
+        let control = NegativeControlResult {
+            control_id: "neg-004".to_string(),
+            control_status: "pass".to_string(),
+            candidates: vec![NegativeControlCandidate {
+                accession_or_group: "ACC-A".to_string(),
+                unique_fraction: 0.05,
+            }],
+        };
+        let compared = apply_negative_control(
+            &[candidate_call()
+                .with_raw_fraction(0.25)
+                .with_unique_fraction(0.10)
+                .build()],
+            &NegativeControlDecisionInput::Passed {
+                comparator: BackgroundComparator::new(&control),
+                result: control,
+            },
+        );
+
+        assert!((compared[0].background_ratio - 2.0).abs() < 1e-12);
+    }
+
     fn decision_engine() -> DecisionEngine {
         DecisionEngine::new(
             &DecisionRules {
@@ -417,6 +441,11 @@ mod tests {
 
         fn with_unique_fraction(mut self, unique_fraction: f64) -> Self {
             self.inner.unique_fraction = unique_fraction;
+            self
+        }
+
+        fn with_raw_fraction(mut self, raw_fraction: f64) -> Self {
+            self.inner.raw_fraction = raw_fraction;
             self
         }
 

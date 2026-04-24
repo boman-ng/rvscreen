@@ -1,6 +1,7 @@
 pub mod representative;
 pub mod streaming;
 
+pub(crate) use representative::{RankedRepresentative, RepresentativeRetention};
 pub use representative::{RepresentativeSampler, RoundManager, DEFAULT_REPRESENTATIVE_ROUNDS};
 pub use streaming::StreamingSampler;
 

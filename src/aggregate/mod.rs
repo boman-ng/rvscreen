@@ -4,7 +4,7 @@ use crate::align::{AlignHit, FragmentAlignResult};
 use crate::decision::ProportionEstimate;
 use crate::error::{Result, RvScreenError};
 use crate::qc::QcStats;
-use crate::types::{CandidateCall, DecisionStatus, EvidenceStrength, FragmentClass};
+use crate::types::{CandidateCall, DecisionStatus, EvidenceStrength, FragmentClass, HotPathId};
 use interval::{covered_bases, merge_intervals, Interval};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,11 +20,12 @@ pub struct CandidateAggregator {
     level: AggregationLevel,
     total_sampled_fragments: Option<u64>,
     fragments_seen: u64,
-    candidates: BTreeMap<String, CandidateAccumulator>,
+    candidates: BTreeMap<HotPathId, CandidateAccumulator>,
 }
 
 #[derive(Debug, Clone)]
 struct CandidateAccumulator {
+    candidate_id: HotPathId,
     level: AggregationLevel,
     accession_or_group: String,
     representative_virus_name: String,
@@ -32,8 +33,9 @@ struct CandidateAccumulator {
     taxid: u64,
     accepted_fragments: u64,
     ambiguous_fragments: u64,
-    contig_lengths: BTreeMap<String, u64>,
-    intervals_by_contig: BTreeMap<String, Vec<Interval>>,
+    contig_lengths: BTreeMap<HotPathId, u64>,
+    contig_labels: BTreeMap<HotPathId, String>,
+    intervals_by_contig: BTreeMap<HotPathId, Vec<Interval>>,
 }
 
 impl CandidateAggregator {
@@ -110,8 +112,8 @@ impl CandidateAggregator {
             FragmentClass::Ambiguous => {
                 let mut seen_candidates = BTreeSet::new();
                 for hit in ambiguous_candidate_hits(align_result) {
-                    let candidate_key = candidate_key(self.level, hit)?;
-                    if seen_candidates.insert(candidate_key) {
+                    let candidate_id = candidate_id(self.level, hit)?;
+                    if seen_candidates.insert(candidate_id) {
                         self.record_hit(hit, true)?;
                     }
                 }
@@ -121,14 +123,13 @@ impl CandidateAggregator {
         }
     }
 
-    pub fn finalize(&self, qc_stats: &QcStats) -> Vec<CandidateCall> {
+    pub fn finalize(&self, _qc_stats: &QcStats) -> Vec<CandidateCall> {
         let total_sampled_fragments = self.total_sampled_fragments.unwrap_or(self.fragments_seen);
-        let qc_passing_fragments = qc_stats.passed_fragments;
 
         let mut calls = self
             .candidates
             .values()
-            .map(|candidate| candidate.to_call(total_sampled_fragments, qc_passing_fragments))
+            .map(|candidate| candidate.to_call(total_sampled_fragments))
             .collect::<Vec<_>>();
 
         calls.sort_by(|left, right| {
@@ -143,10 +144,10 @@ impl CandidateAggregator {
     }
 
     fn record_hit(&mut self, hit: &AlignHit, ambiguous_only: bool) -> Result<()> {
-        let candidate_key = candidate_key(self.level, hit)?;
+        let candidate_id = candidate_id(self.level, hit)?;
         let accumulator = self
             .candidates
-            .entry(candidate_key)
+            .entry(candidate_id)
             .or_insert_with(|| CandidateAccumulator::new(self.level, hit));
         accumulator.observe_hit(hit, ambiguous_only)
     }
@@ -160,6 +161,7 @@ impl CandidateAccumulator {
             .expect("validated virus-target metadata before accumulator initialization");
 
         Self {
+            candidate_id: candidate_id_from_target(level, target),
             level,
             accession_or_group: candidate_label(level, target),
             representative_virus_name: target.virus_name.clone(),
@@ -168,6 +170,7 @@ impl CandidateAccumulator {
             accepted_fragments: 0,
             ambiguous_fragments: 0,
             contig_lengths: BTreeMap::new(),
+            contig_labels: BTreeMap::new(),
             intervals_by_contig: BTreeMap::new(),
         }
     }
@@ -183,16 +186,18 @@ impl CandidateAccumulator {
             )
         })?;
 
+        let expected_candidate_id = candidate_id_from_target(self.level, target);
         let expected_label = candidate_label(self.level, target);
-        if self.accession_or_group != expected_label {
+        if self.candidate_id != expected_candidate_id {
             return Err(RvScreenError::validation(
                 "aggregate.candidate_key",
                 format!(
-                    "candidate key drift for contig `{}`: expected `{}`, observed `{}`",
-                    hit.contig, self.accession_or_group, expected_label
+                    "candidate key drift for contig `{}`: expected `{}` ({expected_candidate_id}), observed `{}` ({})",
+                    hit.contig, expected_label, self.accession_or_group, self.candidate_id
                 ),
             ));
         }
+        debug_assert_eq!(self.accession_or_group, expected_label);
 
         if self.taxid != target.taxid {
             return Err(RvScreenError::validation(
@@ -221,7 +226,7 @@ impl CandidateAccumulator {
             self.mixed_virus_names = true;
         }
 
-        match self.contig_lengths.get(&hit.contig) {
+        match self.contig_lengths.get(&hit.contig_id) {
             Some(existing) if *existing != target.genome_length => {
                 return Err(RvScreenError::validation(
                     "aggregate.genome_length",
@@ -234,7 +239,8 @@ impl CandidateAccumulator {
             Some(_) => {}
             None => {
                 self.contig_lengths
-                    .insert(hit.contig.clone(), target.genome_length);
+                    .insert(hit.contig_id, target.genome_length);
+                self.contig_labels.insert(hit.contig_id, hit.contig.clone());
             }
         }
 
@@ -255,7 +261,7 @@ impl CandidateAccumulator {
 
         self.accepted_fragments = self.accepted_fragments.saturating_add(1);
         self.intervals_by_contig
-            .entry(hit.contig.clone())
+            .entry(hit.contig_id)
             .or_default()
             .push(Interval::new(hit.reference_start, hit.reference_end));
         Ok(())
@@ -274,12 +280,15 @@ impl CandidateAccumulator {
             ));
         }
 
-        if self.accession_or_group != other.accession_or_group {
+        if self.candidate_id != other.candidate_id {
             return Err(RvScreenError::validation(
                 "aggregate.candidate_key",
                 format!(
-                    "cannot merge candidate accumulators `{}` and `{}`",
-                    self.accession_or_group, other.accession_or_group
+                    "cannot merge candidate accumulators `{}` ({}) and `{}` ({})",
+                    self.accession_or_group,
+                    self.candidate_id,
+                    other.accession_or_group,
+                    other.candidate_id
                 ),
             ));
         }
@@ -325,11 +334,17 @@ impl CandidateAccumulator {
         for (contig, genome_length) in other.contig_lengths {
             match self.contig_lengths.get(&contig) {
                 Some(existing) if *existing != genome_length => {
+                    let contig_label = other
+                        .contig_labels
+                        .get(&contig)
+                        .or_else(|| self.contig_labels.get(&contig))
+                        .cloned()
+                        .unwrap_or_else(|| format!("contig#{contig}"));
                     return Err(RvScreenError::validation(
                         "aggregate.genome_length",
                         format!(
                             "contig `{}` saw conflicting genome_length values: {} vs {}",
-                            contig, existing, genome_length
+                            contig_label, existing, genome_length
                         ),
                     ));
                 }
@@ -338,6 +353,10 @@ impl CandidateAccumulator {
                     self.contig_lengths.insert(contig, genome_length);
                 }
             }
+        }
+
+        for (contig, label) in other.contig_labels {
+            self.contig_labels.entry(contig).or_insert(label);
         }
 
         for (contig, mut intervals) in other.intervals_by_contig {
@@ -350,7 +369,7 @@ impl CandidateAccumulator {
         Ok(())
     }
 
-    fn to_call(&self, total_sampled_fragments: u64, qc_passing_fragments: u64) -> CandidateCall {
+    fn to_call(&self, total_sampled_fragments: u64) -> CandidateCall {
         let mut nonoverlap_fragments = 0u64;
         let mut covered_bases_total = 0u64;
         for (contig, intervals) in &self.intervals_by_contig {
@@ -362,11 +381,8 @@ impl CandidateAccumulator {
 
         let genome_length = self.contig_lengths.values().copied().sum::<u64>();
         let breadth = ratio(covered_bases_total, genome_length);
-        let stats = ProportionEstimate::from_counts(
-            self.accepted_fragments,
-            total_sampled_fragments,
-            qc_passing_fragments,
-        );
+        let stats =
+            ProportionEstimate::from_counts(self.accepted_fragments, total_sampled_fragments);
 
         CandidateCall {
             virus_name: self.output_virus_name(),
@@ -424,7 +440,7 @@ fn ambiguous_candidate_hits(align_result: &FragmentAlignResult) -> Vec<&AlignHit
         .collect()
 }
 
-fn candidate_key(level: AggregationLevel, hit: &AlignHit) -> Result<String> {
+fn candidate_id(level: AggregationLevel, hit: &AlignHit) -> Result<HotPathId> {
     let target = hit.virus_target.as_ref().ok_or_else(|| {
         RvScreenError::validation(
             "aggregate.virus_target",
@@ -445,7 +461,17 @@ fn candidate_key(level: AggregationLevel, hit: &AlignHit) -> Result<String> {
             ),
         ));
     }
-    Ok(label)
+    Ok(candidate_id_from_target(level, target))
+}
+
+fn candidate_id_from_target(
+    level: AggregationLevel,
+    target: &crate::align::VirusTarget,
+) -> HotPathId {
+    match level {
+        AggregationLevel::Accession => target.target_id,
+        AggregationLevel::VirusGroup => target.group_id,
+    }
 }
 
 fn candidate_label(level: AggregationLevel, target: &crate::align::VirusTarget) -> String {
@@ -617,6 +643,37 @@ mod tests {
         assert!((calls[0].raw_fraction - 0.5).abs() < 1e-9);
     }
 
+    #[test]
+    fn denominator_uses_sampled_fragments_instead_of_qc_pass_volume() {
+        let mut aggregator = CandidateAggregator::new().with_total_sampled_fragments(5);
+
+        aggregator
+            .add_fragment(
+                FragmentClass::Virus,
+                &virus_alignment("virus-e", "ACC-E", "noro", 12_753, 500, 0, 90),
+            )
+            .expect("first sampled fragment should aggregate");
+        aggregator
+            .add_fragment(
+                FragmentClass::Virus,
+                &virus_alignment("virus-e", "ACC-E", "noro", 12_753, 500, 120, 210),
+            )
+            .expect("second sampled fragment should aggregate");
+
+        let calls = aggregator.finalize(&qc_stats(10));
+        assert_eq!(calls.len(), 1);
+        assert!((calls[0].raw_fraction - 0.4).abs() < 1e-12);
+        assert!((calls[0].unique_fraction - 0.4).abs() < 1e-12);
+        assert_eq!(
+            calls[0].fraction_ci_95,
+            crate::decision::stats::wilson_ci_95(2, 5)
+        );
+        assert_eq!(
+            calls[0].clopper_pearson_upper,
+            crate::decision::stats::clopper_pearson_upper_95_one_sided(2, 5)
+        );
+    }
+
     fn virus_alignment(
         contig: &str,
         accession: &str,
@@ -671,6 +728,7 @@ mod tests {
         reference_end: u64,
     ) -> AlignHit {
         AlignHit {
+            contig_id: 1,
             contig: contig.to_string(),
             mapq: 60,
             as_score: Some(100),
@@ -683,6 +741,9 @@ mod tests {
             reference_start,
             reference_end,
             virus_target: Some(VirusTarget {
+                target_id: 11,
+                contig_id: 1,
+                group_id: 21,
                 accession: accession.to_string(),
                 group: group.to_string(),
                 taxid,

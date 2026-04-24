@@ -328,6 +328,7 @@ mod tests {
             best_host_hit: None,
             best_virus_hit: None,
             secondary_hits: vec![AlignHit {
+                contig_id: 0,
                 contig: "virus-secondary".to_string(),
                 mapq: 42,
                 as_score: Some(88),
@@ -408,6 +409,7 @@ mod tests {
 
     fn host_hit(as_score: i32) -> AlignHit {
         AlignHit {
+            contig_id: 0,
             contig: "host-chr1".to_string(),
             mapq: 45,
             as_score: Some(as_score),
@@ -425,6 +427,7 @@ mod tests {
 
     fn virus_hit(as_score: i32) -> AlignHit {
         AlignHit {
+            contig_id: 0,
             contig: "virus-alpha".to_string(),
             mapq: 30,
             as_score: Some(as_score),

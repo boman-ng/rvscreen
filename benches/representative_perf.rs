@@ -2,9 +2,7 @@ use criterion::{black_box, BenchmarkId, Criterion, Throughput};
 use rayon::prelude::*;
 use rvscreen::align::{CompetitiveAligner, CompetitivePreset, FragmentAlignResult};
 use rvscreen::io::{FastqPairReader, FragmentRecord};
-use rvscreen::pipeline::{run_screen, PreparedScreenRunner};
-use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
-use rvscreen::types::{BundleManifest, ContigEntry};
+use rvscreen::pipeline::{run_screen, PreparedScreenRunner, ScreenPerfMetrics};
 use rvscreen::{cli::ScreenArgs, cli::ScreenMode};
 use std::env;
 use std::fs;
@@ -17,9 +15,11 @@ use tempfile::TempDir;
 #[path = "../tests/testutil/mod.rs"]
 mod testutil;
 
+mod support;
+
+use support::{prepare_reference_bundle, write_calibration_profile, CalibrationProfile};
 use testutil::{
-    generate_fastq_pair, generate_mini_reference, FastqPairConfig, ReadComponent, SyntheticSource,
-    VirusSelector,
+    generate_fastq_pair, FastqPairConfig, ReadComponent, SyntheticSource, VirusSelector,
 };
 
 const IO_FRAGMENT_COUNT: usize = 32_000;
@@ -32,11 +32,11 @@ const CI_E2E_SUMMARY_REPEATS: usize = 2;
 const DEFAULT_THREAD_CURVE: [usize; 4] = [1, 2, 4, 8];
 const CI_THREAD_CURVE: [usize; 2] = [1, 4];
 const DEFAULT_E2E_THREADS: [usize; 2] = [1, 4];
-const SUMMARY_PATH: &str = "target/criterion/task26_summary.tsv";
+const SUMMARY_PATH: &str = "target/criterion/representative_perf_summary.tsv";
 const MAX_THREAD_BUDGET: usize = 16;
 
 fn main() {
-    real_main().expect("Task 26 benchmark suite should succeed");
+    real_main().expect("representative perf benchmark suite should succeed");
 }
 
 fn real_main() -> io::Result<()> {
@@ -75,7 +75,7 @@ fn real_main() -> io::Result<()> {
 }
 
 fn benchmark_fastq_input(criterion: &mut Criterion, fixture: &BenchmarkFixture) {
-    let mut group = criterion.benchmark_group("task26_input_throughput");
+    let mut group = criterion.benchmark_group("representative_perf_input_throughput");
     group.throughput(Throughput::Elements(fixture.fragment_count as u64));
     group.bench_function("fastq_pair_read", |bencher| {
         bencher.iter(|| {
@@ -93,7 +93,7 @@ fn benchmark_alignment(
     fragments: &[FragmentRecord],
     settings: &BenchSettings,
 ) {
-    let mut group = criterion.benchmark_group("task26_alignment_throughput");
+    let mut group = criterion.benchmark_group("representative_perf_alignment_throughput");
     group.throughput(Throughput::Elements(fragments.len() as u64));
 
     for &threads in &settings.alignment_threads {
@@ -118,8 +118,12 @@ fn benchmark_alignment(
     group.finish();
 }
 
-fn benchmark_end_to_end(criterion: &mut Criterion, fixture: &BenchmarkFixture, settings: &BenchSettings) {
-    let mut group = criterion.benchmark_group("task26_end_to_end_latency");
+fn benchmark_end_to_end(
+    criterion: &mut Criterion,
+    fixture: &BenchmarkFixture,
+    settings: &BenchSettings,
+) {
+    let mut group = criterion.benchmark_group("representative_perf_end_to_end_latency");
     group.sample_size(settings.sample_size);
     group.measurement_time(settings.end_to_end_measurement_time);
     group.throughput(Throughput::Elements(fixture.fragment_count as u64));
@@ -146,7 +150,7 @@ fn benchmark_end_to_end(criterion: &mut Criterion, fixture: &BenchmarkFixture, s
 
     group.finish();
 
-    let mut cold_group = criterion.benchmark_group("task26_prepare_cold_start");
+    let mut cold_group = criterion.benchmark_group("representative_perf_prepare_cold_start");
     cold_group.sample_size(settings.sample_size);
     cold_group.measurement_time(settings.end_to_end_measurement_time);
 
@@ -191,7 +195,7 @@ fn collect_summary(
         let thread_pool = thread_pool_for(threads)?;
         rows.push(measure_pairs_per_second(
             "alignment_throughput",
-            "competitive_align",
+            "representative_retained_sample_align",
             threads,
             settings.summary_repeats,
             || align_all_fragments(alignment_fragments, &aligner, thread_pool.as_ref()),
@@ -199,7 +203,7 @@ fn collect_summary(
 
         rows.push(measure_latency_ms(
             "startup_latency",
-            "competitive_aligner_prepare",
+            "representative_aligner_prepare_only",
             threads,
             settings.summary_repeats,
             || {
@@ -214,7 +218,7 @@ fn collect_summary(
     for &threads in &settings.end_to_end_threads {
         rows.push(measure_latency_ms(
             "end_to_end_latency",
-            "screen_to_report_bundle",
+            "representative_scan_align_report_bundle",
             threads,
             settings.end_to_end_summary_repeats,
             || {
@@ -233,7 +237,7 @@ fn collect_summary(
 
         rows.push(measure_latency_ms(
             "startup_latency",
-            "screen_prepare_only",
+            "representative_prepare_only",
             threads,
             settings.end_to_end_summary_repeats,
             || {
@@ -249,7 +253,7 @@ fn collect_summary(
 
         rows.push(measure_latency_ms(
             "end_to_end_latency",
-            "prepared_runner_execute_only",
+            "representative_execute_only_no_scan_report",
             threads,
             settings.end_to_end_summary_repeats,
             || {
@@ -260,7 +264,9 @@ fn collect_summary(
                 let mut execute_args = args.clone();
                 execute_args.out = execute_output_dir.clone();
                 let started = Instant::now();
-                let outcome = prepared.run_without_report(&execute_args).map_err(io_other)?;
+                let outcome = prepared
+                    .run_without_report(&execute_args)
+                    .map_err(io_other)?;
                 assert_eq!(
                     outcome.summary.sampled_fragments,
                     e2e_fixture.fragment_count as u64
@@ -282,6 +288,129 @@ fn collect_summary(
         unit: "KiB",
         cv_pct: 0.0,
     });
+
+    let perf_rows = collect_representative_stage_summary(e2e_fixture, settings)?;
+    rows.extend(perf_rows);
+
+    Ok(rows)
+}
+
+fn collect_representative_stage_summary(
+    e2e_fixture: &BenchmarkFixture,
+    settings: &BenchSettings,
+) -> io::Result<Vec<SummaryRow>> {
+    let mut rows = Vec::new();
+
+    for &threads in &settings.end_to_end_threads {
+        rows.push(measure_perf_metric(
+            "input_fragments",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.input_fragments as f64,
+            "fragments",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-scan"),
+        )?);
+        rows.push(measure_perf_metric(
+            "qc_passing_fragments",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.qc_passing_fragments as f64,
+            "fragments",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-align"),
+        )?);
+        rows.push(measure_perf_metric(
+            "representative_sampled_final",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.representative_sampled_final as f64,
+            "fragments",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-aggregate"),
+        )?);
+        rows.push(measure_perf_metric(
+            "representative_round_sampled",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.representative_round_sampled as f64,
+            "fragments",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-sample"),
+        )?);
+        rows.push(measure_perf_metric(
+            "minimap2_calls",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.minimap2_calls as f64,
+            "calls",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-scan-latency"),
+        )?);
+        rows.push(measure_perf_metric(
+            "io_wall_ms",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.io_wall_duration.as_secs_f64() * 1_000.0,
+            "ms",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-align-latency"),
+        )?);
+        rows.push(measure_perf_metric(
+            "qc_hash_wall_ms",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.qc_hash_wall_duration.as_secs_f64() * 1_000.0,
+            "ms",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-aggregate-latency"),
+        )?);
+        rows.push(measure_perf_metric(
+            "align_wall_ms",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.align_wall_duration.as_secs_f64() * 1_000.0,
+            "ms",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-align-wall"),
+        )?);
+        rows.push(measure_perf_metric(
+            "aggregate_wall_ms",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.aggregate_wall_duration.as_secs_f64() * 1_000.0,
+            "ms",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-aggregate-wall"),
+        )?);
+        rows.push(measure_perf_metric(
+            "executor_queue_wait_ms",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.executor_queue_wait_duration.as_secs_f64() * 1_000.0,
+            "ms",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-queue-wait"),
+        )?);
+        rows.push(measure_perf_metric(
+            "peak_heap_bytes",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.peak_heap_bytes as f64,
+            "bytes",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-heap"),
+        )?);
+        rows.push(measure_perf_metric(
+            "aggregate_candidate_count",
+            "representative_scan_qc_align_aggregate",
+            threads,
+            settings.end_to_end_summary_repeats,
+            |metrics| metrics.aggregate_candidate_count as f64,
+            "candidates",
+            || run_perf_screen(e2e_fixture, threads, "summary-stage-candidate-count"),
+        )?);
+    }
 
     Ok(rows)
 }
@@ -339,6 +468,48 @@ where
         unit: "ms",
         cv_pct: coefficient_of_variation_pct(&samples),
     })
+}
+
+fn measure_perf_metric<FRun, FExtract>(
+    metric: &'static str,
+    scenario: &'static str,
+    threads: usize,
+    repeats: usize,
+    mut extract: FExtract,
+    unit: &'static str,
+    mut run: FRun,
+) -> io::Result<SummaryRow>
+where
+    FRun: FnMut() -> io::Result<ScreenPerfMetrics>,
+    FExtract: FnMut(&ScreenPerfMetrics) -> f64,
+{
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let metrics = run()?;
+        samples.push(extract(&metrics));
+    }
+
+    Ok(SummaryRow {
+        metric,
+        scenario: scenario.to_string(),
+        threads: threads.to_string(),
+        repeats,
+        mean: mean(&samples),
+        unit,
+        cv_pct: coefficient_of_variation_pct(&samples),
+    })
+}
+
+fn run_perf_screen(
+    fixture: &BenchmarkFixture,
+    threads: usize,
+    prefix: &str,
+) -> io::Result<ScreenPerfMetrics> {
+    let output_dir = fixture.output_dir(prefix, threads);
+    let outcome =
+        run_screen(&fixture.screen_args(threads, output_dir.clone())).map_err(io_other)?;
+    fs::remove_dir_all(output_dir).ok();
+    Ok(outcome.perf_metrics)
 }
 
 fn count_fastq_pairs(r1: &Path, r2: &Path) -> io::Result<usize> {
@@ -409,7 +580,7 @@ fn write_summary(rows: &[SummaryRow], path: &Path) -> io::Result<()> {
     let mut body = String::from("metric\tscenario\tthreads\trepeats\tmean\tunit\tcv_pct\n");
     for row in rows {
         body.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{}\t{:.3}\n",
+            "{}\t{}\t{}\t{}\t{:.6}\t{}\t{:.3}\n",
             row.metric, row.scenario, row.threads, row.repeats, row.mean, row.unit, row.cv_pct
         ));
     }
@@ -481,7 +652,8 @@ impl BenchSettings {
         let ci = ci_mode();
         Self {
             alignment_threads: parse_thread_list(
-                "RVSCREEN_TASK26_ALIGNMENT_THREADS",
+                "RVSCREEN_REPRESENTATIVE_PERF_ALIGNMENT_THREADS",
+                Some("RVSCREEN_TASK26_ALIGNMENT_THREADS"),
                 if ci {
                     &CI_THREAD_CURVE[..]
                 } else {
@@ -489,35 +661,46 @@ impl BenchSettings {
                 },
             ),
             end_to_end_threads: parse_thread_list(
-                "RVSCREEN_TASK26_E2E_THREADS",
+                "RVSCREEN_REPRESENTATIVE_PERF_E2E_THREADS",
+                Some("RVSCREEN_TASK26_E2E_THREADS"),
                 &DEFAULT_E2E_THREADS[..],
             ),
-            summary_repeats: env::var("RVSCREEN_TASK26_SUMMARY_REPEATS")
+            summary_repeats: env::var("RVSCREEN_REPRESENTATIVE_PERF_SUMMARY_REPEATS")
+                .or_else(|_| env::var("RVSCREEN_TASK26_SUMMARY_REPEATS"))
                 .ok()
-                .map(|value| parse_positive_usize(&value, "RVSCREEN_TASK26_SUMMARY_REPEATS"))
+                .map(|value| {
+                    parse_positive_usize(&value, "RVSCREEN_REPRESENTATIVE_PERF_SUMMARY_REPEATS")
+                })
                 .unwrap_or(if ci {
                     CI_SUMMARY_REPEATS
                 } else {
                     DEFAULT_SUMMARY_REPEATS
                 }),
-            end_to_end_summary_repeats: env::var("RVSCREEN_TASK26_E2E_SUMMARY_REPEATS")
+            end_to_end_summary_repeats: env::var(
+                "RVSCREEN_REPRESENTATIVE_PERF_E2E_SUMMARY_REPEATS",
+            )
+            .or_else(|_| env::var("RVSCREEN_TASK26_E2E_SUMMARY_REPEATS"))
+            .ok()
+            .map(|value| {
+                parse_positive_usize(&value, "RVSCREEN_REPRESENTATIVE_PERF_E2E_SUMMARY_REPEATS")
+            })
+            .unwrap_or(if ci {
+                CI_E2E_SUMMARY_REPEATS
+            } else {
+                DEFAULT_E2E_SUMMARY_REPEATS
+            }),
+            sample_size: env::var("RVSCREEN_REPRESENTATIVE_PERF_SAMPLE_SIZE")
+                .or_else(|_| env::var("RVSCREEN_TASK26_SAMPLE_SIZE"))
                 .ok()
                 .map(|value| {
-                    parse_positive_usize(&value, "RVSCREEN_TASK26_E2E_SUMMARY_REPEATS")
+                    parse_positive_usize(&value, "RVSCREEN_REPRESENTATIVE_PERF_SAMPLE_SIZE")
                 })
-                .unwrap_or(if ci {
-                    CI_E2E_SUMMARY_REPEATS
-                } else {
-                    DEFAULT_E2E_SUMMARY_REPEATS
-                }),
-            sample_size: env::var("RVSCREEN_TASK26_SAMPLE_SIZE")
-                .ok()
-                .map(|value| parse_positive_usize(&value, "RVSCREEN_TASK26_SAMPLE_SIZE"))
                 .unwrap_or(10),
             warm_up_time: Duration::from_secs(1),
             measurement_time: Duration::from_secs(if ci { 1 } else { 2 }),
             end_to_end_measurement_time: Duration::from_secs(if ci { 1 } else { 3 }),
-            summary_path: env::var_os("RVSCREEN_TASK26_SUMMARY_PATH")
+            summary_path: env::var_os("RVSCREEN_REPRESENTATIVE_PERF_SUMMARY_PATH")
+                .or_else(|| env::var_os("RVSCREEN_TASK26_SUMMARY_PATH"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(SUMMARY_PATH)),
         }
@@ -539,10 +722,18 @@ impl BenchmarkFixture {
         let tempdir = tempfile::tempdir()?;
         let base_dir = tempdir.path().to_path_buf();
         let bundle = prepare_reference_bundle(&base_dir)?;
+        let first_round = (fragment_count / 2).max(1);
+        let rounds = [first_round, fragment_count];
         let calibration_dir = write_calibration_profile(
             base_dir.join("calibration"),
             &bundle.version,
-            fragment_count,
+            &CalibrationProfile {
+                profile_id: "rvscreen_calib_representative_perf",
+                seed: 20260421,
+                rounds: &rounds,
+                max_rounds: 2,
+                max_background_ratio: 1.0,
+            },
         )?;
         let (r1, r2) = generate_fastq_pair(
             &FastqPairConfig::new(fragment_count, 100, seed)
@@ -602,134 +793,17 @@ impl BenchmarkFixture {
     }
 }
 
-struct ReferenceBundleFixture {
-    bundle_dir: PathBuf,
-    version: String,
-}
-
-fn prepare_reference_bundle(base_dir: &Path) -> io::Result<ReferenceBundleFixture> {
-    let mini_reference_dir = generate_mini_reference()?;
-    let manifest_path = mini_reference_dir.join("manifest.json");
-    let fasta_path = mini_reference_dir.join("mini_reference.fa");
-    let manifest: BundleManifest =
-        serde_json::from_str(&fs::read_to_string(&manifest_path)?).map_err(io_other)?;
-    let sequences = read_fasta_records(&fasta_path)?;
-
-    let inputs_dir = base_dir.join("reference-inputs");
-    fs::create_dir_all(&inputs_dir)?;
-    let host_fasta = inputs_dir.join("host.fa");
-    let virus_fasta = inputs_dir.join("virus.fa");
-    let decoy_fasta = inputs_dir.join("decoy.fa");
-    let manifest_out = inputs_dir.join("manifest.json");
-    let taxonomy = inputs_dir.join("taxonomy.tsv");
-
-    write_group_fasta(&host_fasta, &manifest.0, &sequences, "human")?;
-    write_group_fasta(&virus_fasta, &manifest.0, &sequences, "virus")?;
-    write_group_fasta(&decoy_fasta, &manifest.0, &sequences, "decoy")?;
-    fs::copy(&manifest_path, &manifest_out)?;
-    write_taxonomy(&taxonomy, &manifest.0)?;
-
-    let bundle_dir = base_dir.join("reference-bundle");
-    let outcome = build_reference_bundle(&BuildReferenceBundleRequest {
-        host_fasta,
-        virus_fasta,
-        decoy_fasta: Some(decoy_fasta),
-        manifest: manifest_out,
-        taxonomy,
-        out_dir: bundle_dir.clone(),
-    })
-    .map_err(io_other)?;
-
-    Ok(ReferenceBundleFixture {
-        bundle_dir,
-        version: outcome.bundle.version,
-    })
-}
-
-fn write_calibration_profile(
-    dir: PathBuf,
-    reference_bundle: &str,
-    fragment_count: usize,
-) -> io::Result<PathBuf> {
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join("profile.toml"),
-        format!(
-            "profile_id = \"rvscreen_calib_task26_perf\"\nstatus = \"release_candidate\"\nreference_bundle = \"{reference_bundle}\"\nbackend = \"minimap2\"\npreset = \"sr-conservative\"\nseed = 20260421\nsupported_input = [\"fastq\", \"fastq.gz\", \"bam\", \"ubam\", \"cram\"]\nsupported_read_type = [\"illumina_pe_shortread\"]\nnegative_control_required = false\n\n[sampling]\nmode = \"representative\"\nrounds = [{fragment_count}]\nmax_rounds = 1\n\n[fragment_rules]\nmin_mapq = 0\nmin_as_diff = 0\nmax_nm = 100\nrequire_pair_consistency = true\n\n[candidate_rules]\nmin_nonoverlap_fragments = 1\nmin_breadth = 0.0\nmax_background_ratio = 0.0\n\n[decision_rules]\ntheta_pos = 0.01\ntheta_neg = 0.0001\nallow_indeterminate = true\n"
-        ),
-    )?;
-    Ok(dir)
-}
-
-fn read_fasta_records(path: &Path) -> io::Result<Vec<(String, String)>> {
-    let mut records = Vec::new();
-    let mut current_header: Option<String> = None;
-    let mut current_sequence = String::new();
-
-    for line in fs::read_to_string(path)?.lines() {
-        if let Some(header) = line.strip_prefix('>') {
-            if let Some(previous) = current_header.replace(header.to_string()) {
-                records.push((previous, std::mem::take(&mut current_sequence)));
-            }
-        } else if !line.trim().is_empty() {
-            current_sequence.push_str(line.trim());
-        }
-    }
-
-    if let Some(header) = current_header {
-        records.push((header, current_sequence));
-    }
-
-    Ok(records)
-}
-
-fn write_group_fasta(
-    path: &Path,
-    entries: &[ContigEntry],
-    sequences: &[(String, String)],
-    group: &str,
-) -> io::Result<()> {
-    let mut body = String::new();
-
-    for entry in entries.iter().filter(|entry| entry.group == group) {
-        let sequence = sequences
-            .iter()
-            .find_map(|(header, sequence)| (header == &entry.contig).then_some(sequence))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing FASTA sequence for {}", entry.contig),
-                )
-            })?;
-        body.push('>');
-        body.push_str(&entry.contig);
-        body.push('\n');
-        body.push_str(sequence);
-        body.push('\n');
-    }
-
-    fs::write(path, body)
-}
-
-fn write_taxonomy(path: &Path, entries: &[ContigEntry]) -> io::Result<()> {
-    let mut rows = String::from("taxid\tname\n");
-    let mut seen = std::collections::BTreeSet::new();
-
-    for entry in entries {
-        if seen.insert((entry.taxid, entry.virus_name.clone())) {
-            rows.push_str(&format!("{}\t{}\n", entry.taxid, entry.virus_name));
-        }
-    }
-
-    fs::write(path, rows)
-}
-
 fn io_other(error: impl ToString) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-fn parse_thread_list(name: &str, default: &[usize]) -> Vec<usize> {
+fn parse_thread_list(name: &str, legacy_name: Option<&str>, default: &[usize]) -> Vec<usize> {
     let threads = env::var(name)
+        .or_else(|_| {
+            legacy_name
+                .map(env::var)
+                .unwrap_or_else(|| Err(env::VarError::NotPresent))
+        })
         .ok()
         .map(|value| {
             value

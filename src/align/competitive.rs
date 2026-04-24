@@ -1,6 +1,6 @@
 use crate::error::{Result, RvScreenError};
 use crate::io::fastq::FragmentRecord;
-use crate::types::{BundleManifest, ContigEntry};
+use crate::types::{BundleManifest, ContigEntry, HotPathId};
 use minimap2::{Aligner, Built, Mapping};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -28,6 +28,9 @@ enum ContigClass {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirusTarget {
+    pub target_id: HotPathId,
+    pub contig_id: HotPathId,
+    pub group_id: HotPathId,
     pub accession: String,
     pub group: String,
     pub taxid: u64,
@@ -37,6 +40,7 @@ pub struct VirusTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlignHit {
+    pub contig_id: HotPathId,
     pub contig: String,
     pub mapq: u32,
     pub as_score: Option<i32>,
@@ -61,8 +65,8 @@ pub struct FragmentAlignResult {
 #[derive(Clone)]
 pub struct CompetitiveAligner {
     aligner: Arc<Aligner<Built>>,
-    contig_classes: BTreeMap<String, ContigClass>,
-    virus_targets: BTreeMap<String, VirusTarget>,
+    contig_metadata_by_name: BTreeMap<String, ContigMetadata>,
+    virus_targets_by_contig: BTreeMap<HotPathId, VirusTarget>,
     reference_input: PathBuf,
     manifest_path: PathBuf,
     preset: CompetitivePreset,
@@ -70,9 +74,16 @@ pub struct CompetitiveAligner {
     kalloc_cap: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContigMetadata {
+    contig_id: HotPathId,
+    class: ContigClass,
+}
+
 #[derive(Debug, Clone)]
 struct ContigAggregate {
     class: ContigClass,
+    contig_id: HotPathId,
     contig: String,
     representative: Mapping,
     r1_mapped: bool,
@@ -123,14 +134,14 @@ impl CompetitiveAligner {
     ) -> Result<Self> {
         let thread_budget = normalize_thread_budget(threads)?;
         let manifest = load_manifest(&manifest_path)?;
-        let (contig_classes, virus_targets) = build_contig_indexes(&manifest)?;
+        let (contig_metadata_by_name, virus_targets_by_contig) = build_contig_indexes(&manifest)?;
         let kalloc_cap = per_thread_kalloc_cap(thread_budget);
         let aligner = build_competitive_aligner(&reference_input, preset, kalloc_cap)?;
 
         Ok(Self {
             aligner: Arc::new(aligner),
-            contig_classes,
-            virus_targets,
+            contig_metadata_by_name,
+            virus_targets_by_contig,
             reference_input,
             manifest_path,
             preset,
@@ -156,13 +167,22 @@ impl CompetitiveAligner {
         let aggregates = self.aggregate_hits(&read1_mappings, &read2_mappings)?;
 
         Ok(FragmentAlignResult {
-            best_host_hit: select_best_hit(&aggregates, ContigClass::Host, &self.virus_targets),
-            best_virus_hit: select_best_hit(&aggregates, ContigClass::Virus, &self.virus_targets),
+            best_host_hit: select_best_hit(
+                &aggregates,
+                ContigClass::Host,
+                &self.virus_targets_by_contig,
+            ),
+            best_virus_hit: select_best_hit(
+                &aggregates,
+                ContigClass::Virus,
+                &self.virus_targets_by_contig,
+            ),
             secondary_hits: collect_secondary_hits(
                 &read1_mappings,
                 &read2_mappings,
                 &aggregates,
-                &self.virus_targets,
+                &self.contig_metadata_by_name,
+                &self.virus_targets_by_contig,
             ),
         })
     }
@@ -200,7 +220,7 @@ impl CompetitiveAligner {
         &self,
         read1_mappings: &[Mapping],
         read2_mappings: &[Mapping],
-    ) -> Result<BTreeMap<String, ContigAggregate>> {
+    ) -> Result<BTreeMap<HotPathId, ContigAggregate>> {
         let mut aggregates = BTreeMap::new();
 
         for mapping in read1_mappings {
@@ -215,14 +235,14 @@ impl CompetitiveAligner {
 
     fn observe_mapping(
         &self,
-        aggregates: &mut BTreeMap<String, ContigAggregate>,
+        aggregates: &mut BTreeMap<HotPathId, ContigAggregate>,
         mapping: &Mapping,
         mate: Mate,
     ) -> Result<()> {
         let Some(contig) = mapping.target_name.as_deref() else {
             return Ok(());
         };
-        let class = *self.contig_classes.get(contig).ok_or_else(|| {
+        let metadata = self.contig_metadata_by_name.get(contig).ok_or_else(|| {
             RvScreenError::validation(
                 "manifest",
                 format!(
@@ -232,18 +252,33 @@ impl CompetitiveAligner {
         })?;
 
         aggregates
-            .entry(contig.to_string())
+            .entry(metadata.contig_id)
             .and_modify(|aggregate| aggregate.observe(mapping, mate))
-            .or_insert_with(|| ContigAggregate::new(contig.to_string(), class, mapping, mate));
+            .or_insert_with(|| {
+                ContigAggregate::new(
+                    metadata.contig_id,
+                    contig.to_string(),
+                    metadata.class,
+                    mapping,
+                    mate,
+                )
+            });
 
         Ok(())
     }
 }
 
 impl ContigAggregate {
-    fn new(contig: String, class: ContigClass, mapping: &Mapping, mate: Mate) -> Self {
+    fn new(
+        contig_id: HotPathId,
+        contig: String,
+        class: ContigClass,
+        mapping: &Mapping,
+        mate: Mate,
+    ) -> Self {
         let mut aggregate = Self {
             class,
+            contig_id,
             contig,
             representative: mapping.clone(),
             r1_mapped: false,
@@ -318,6 +353,7 @@ impl ContigAggregate {
         let (reference_start, reference_end) = self.reference_interval();
 
         AlignHit {
+            contig_id: self.contig_id,
             contig: self.contig.clone(),
             mapq: self.representative.mapq,
             as_score: alignment_score(&self.representative),
@@ -421,9 +457,8 @@ fn discover_reference_input(bundle_dir: &Path) -> Result<PathBuf> {
     discovered.sort();
     discovered.dedup();
 
-    let (mmi_inputs, fasta_inputs): (Vec<_>, Vec<_>) = discovered
-        .into_iter()
-        .partition(|path| is_mmi_path(path));
+    let (mmi_inputs, fasta_inputs): (Vec<_>, Vec<_>) =
+        discovered.into_iter().partition(|path| is_mmi_path(path));
 
     match mmi_inputs.as_slice() {
         [single] => return Ok(single.clone()),
@@ -480,12 +515,25 @@ fn load_manifest(path: &Path) -> Result<BundleManifest> {
 
 fn build_contig_indexes(
     manifest: &BundleManifest,
-) -> Result<(BTreeMap<String, ContigClass>, BTreeMap<String, VirusTarget>)> {
-    let mut contig_classes = BTreeMap::new();
-    let mut virus_targets = BTreeMap::new();
+) -> Result<(
+    BTreeMap<String, ContigMetadata>,
+    BTreeMap<HotPathId, VirusTarget>,
+)> {
+    let mut contig_metadata_by_name = BTreeMap::new();
+    let mut virus_targets_by_contig = BTreeMap::new();
+    let mut target_ids_by_accession = BTreeMap::new();
+    let mut group_ids_by_group = BTreeMap::new();
+    let mut next_contig_id: HotPathId = 1;
+    let mut next_target_id: HotPathId = 1;
+    let mut next_group_id: HotPathId = 1;
     for entry in &manifest.0 {
         let class = classify_contig(entry)?;
-        if contig_classes.insert(entry.contig.clone(), class).is_some() {
+        let contig_id = next_contig_id;
+        next_contig_id = next_contig_id.saturating_add(1);
+        if contig_metadata_by_name
+            .insert(entry.contig.clone(), ContigMetadata { contig_id, class })
+            .is_some()
+        {
             return Err(RvScreenError::validation(
                 "manifest",
                 format!(
@@ -496,19 +544,39 @@ fn build_contig_indexes(
         }
 
         if class == ContigClass::Virus {
-            virus_targets.insert(
-                entry.contig.clone(),
-                VirusTarget {
-                    accession: entry.accession.clone(),
-                    group: entry.group.clone(),
-                    taxid: entry.taxid,
-                    virus_name: entry.virus_name.clone(),
-                    genome_length: entry.genome_length,
-                },
-            );
+            let target_id = *target_ids_by_accession
+                .entry(entry.accession.clone())
+                .or_insert_with(|| {
+                    let current = next_target_id;
+                    next_target_id = next_target_id.saturating_add(1);
+                    current
+                });
+            let group_id = *group_ids_by_group
+                .entry(entry.group.clone())
+                .or_insert_with(|| {
+                    let current = next_group_id;
+                    next_group_id = next_group_id.saturating_add(1);
+                    current
+                });
+            let target = VirusTarget {
+                target_id,
+                contig_id,
+                group_id,
+                accession: entry.accession.clone(),
+                group: entry.group.clone(),
+                taxid: entry.taxid,
+                virus_name: entry.virus_name.clone(),
+                genome_length: entry.genome_length,
+            };
+            if virus_targets_by_contig.insert(contig_id, target).is_some() {
+                return Err(RvScreenError::validation(
+                    "manifest",
+                    format!("duplicate virus target entry for contig `{}`", entry.contig),
+                ));
+            }
         }
     }
-    Ok((contig_classes, virus_targets))
+    Ok((contig_metadata_by_name, virus_targets_by_contig))
 }
 
 fn classify_contig(entry: &ContigEntry) -> Result<ContigClass> {
@@ -609,22 +677,23 @@ fn is_mmi_path(path: &Path) -> bool {
 }
 
 fn select_best_hit(
-    aggregates: &BTreeMap<String, ContigAggregate>,
+    aggregates: &BTreeMap<HotPathId, ContigAggregate>,
     class: ContigClass,
-    virus_targets: &BTreeMap<String, VirusTarget>,
+    virus_targets: &BTreeMap<HotPathId, VirusTarget>,
 ) -> Option<AlignHit> {
     aggregates
         .values()
         .filter(|aggregate| aggregate.class == class)
         .max_by(|left, right| compare_aggregate_priority(left, right))
-        .map(|aggregate| aggregate.to_hit(virus_targets.get(&aggregate.contig)))
+        .map(|aggregate| aggregate.to_hit(virus_targets.get(&aggregate.contig_id)))
 }
 
 fn collect_secondary_hits(
     read1_mappings: &[Mapping],
     read2_mappings: &[Mapping],
-    aggregates: &BTreeMap<String, ContigAggregate>,
-    virus_targets: &BTreeMap<String, VirusTarget>,
+    aggregates: &BTreeMap<HotPathId, ContigAggregate>,
+    contig_metadata_by_name: &BTreeMap<String, ContigMetadata>,
+    virus_targets: &BTreeMap<HotPathId, VirusTarget>,
 ) -> Vec<AlignHit> {
     let mut secondary_hits = read1_mappings
         .iter()
@@ -632,8 +701,10 @@ fn collect_secondary_hits(
         .filter(|mapping| !mapping.is_primary || mapping.is_supplementary)
         .filter_map(|mapping| {
             let contig = mapping.target_name.as_deref()?;
-            let aggregate = aggregates.get(contig)?;
+            let contig_id = contig_metadata_by_name.get(contig)?.contig_id;
+            let aggregate = aggregates.get(&contig_id)?;
             Some(AlignHit {
+                contig_id,
                 contig: contig.to_string(),
                 mapq: mapping.mapq,
                 as_score: alignment_score(mapping),
@@ -645,7 +716,7 @@ fn collect_secondary_hits(
                 pair_consistent: aggregate.pair_consistent(),
                 reference_start: mapping_interval(mapping).map_or(0, |(start, _)| start),
                 reference_end: mapping_interval(mapping).map_or(0, |(_, end)| end),
-                virus_target: virus_targets.get(contig).cloned(),
+                virus_target: virus_targets.get(&contig_id).cloned(),
             })
         })
         .collect::<Vec<_>>();
@@ -983,8 +1054,7 @@ mod tests {
             .expect("fasta should be written");
         let index_dir = bundle_dir.join("index/minimap2");
         fs::create_dir_all(&index_dir).expect("index directory should be created");
-        fs::write(index_dir.join("composite.mmi"), b"mmi")
-            .expect("mmi should be written");
+        fs::write(index_dir.join("composite.mmi"), b"mmi").expect("mmi should be written");
 
         let discovered =
             discover_reference_input(bundle_dir).expect("reference input should be discovered");
@@ -1012,6 +1082,9 @@ mod tests {
         .expect("aligner should load cleanly at the safe global limit");
 
         assert_eq!(aligner.thread_budget(), MAX_THREAD_BUDGET);
-        assert_eq!(aligner.kalloc_cap(), per_thread_kalloc_cap(MAX_THREAD_BUDGET));
+        assert_eq!(
+            aligner.kalloc_cap(),
+            per_thread_kalloc_cap(MAX_THREAD_BUDGET)
+        );
     }
 }

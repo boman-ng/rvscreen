@@ -7,9 +7,17 @@ const COMPOSITE_FASTA: &str = "composite.fa";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScreenInput {
-    FastqPair { r1: PathBuf, r2: PathBuf },
-    Bam { path: PathBuf },
-    Cram { path: PathBuf, reference_fasta: PathBuf },
+    FastqPair {
+        r1: PathBuf,
+        r2: PathBuf,
+    },
+    Bam {
+        path: PathBuf,
+    },
+    Cram {
+        path: PathBuf,
+        reference_fasta: PathBuf,
+    },
 }
 
 impl ScreenInput {
@@ -78,6 +86,13 @@ impl FragmentReaderFactory for ScreenInput {
         }
     }
 
+    fn open_fastq_pair_reader(&self) -> Option<Result<FastqPairReader>> {
+        match self {
+            Self::FastqPair { r1, r2 } => Some(FastqPairReader::open(r1, r2)),
+            _ => None,
+        }
+    }
+
     fn kind_label(&self) -> &'static str {
         match self {
             Self::FastqPair { r1, .. } if is_gzip_path(r1) => "fastq.gz",
@@ -133,10 +148,7 @@ mod tests {
         )
         .expect("paired FASTQ inputs should be accepted");
 
-        assert!(matches!(
-            input,
-            ScreenInput::FastqPair { .. }
-        ));
+        assert!(matches!(input, ScreenInput::FastqPair { .. }));
         assert_eq!(input.kind_label(), "fastq.gz");
     }
 
@@ -147,10 +159,13 @@ mod tests {
         assert!(matches!(bam, ScreenInput::Bam { .. }));
         assert_eq!(bam.kind_label(), "ubam");
 
-        let cram = ScreenInput::from_cli_inputs(&[PathBuf::from("reads.cram")], Path::new("bundle"))
-            .expect("CRAM input should be accepted");
+        let cram =
+            ScreenInput::from_cli_inputs(&[PathBuf::from("reads.cram")], Path::new("bundle"))
+                .expect("CRAM input should be accepted");
         match cram {
-            ScreenInput::Cram { reference_fasta, .. } => {
+            ScreenInput::Cram {
+                reference_fasta, ..
+            } => {
                 assert_eq!(reference_fasta, PathBuf::from("bundle/composite.fa"));
             }
             other => panic!("expected CRAM input, got {other:?}"),
@@ -159,11 +174,9 @@ mod tests {
 
     #[test]
     fn single_fastq_is_rejected_with_boundary_guidance() {
-        let error = ScreenInput::from_cli_inputs(
-            &[PathBuf::from("reads.fastq")],
-            Path::new("bundle"),
-        )
-        .expect_err("single FASTQ input should be rejected");
+        let error =
+            ScreenInput::from_cli_inputs(&[PathBuf::from("reads.fastq")], Path::new("bundle"))
+                .expect_err("single FASTQ input should be rejected");
 
         assert!(error
             .to_string()
