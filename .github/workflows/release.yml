@@ -42,8 +42,19 @@ jobs:
             clang \
             cmake \
             libclang-dev \
+            llvm-dev \
             pkg-config \
             zlib1g-dev
+
+      - name: Configure libclang
+        shell: bash
+        run: |
+          libclang_path="$(find /usr/lib -name 'libclang.so*' -print -quit)"
+          if [[ -z "${libclang_path}" ]]; then
+            echo "libclang.so was not found after installing libclang-dev" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$(dirname "${libclang_path}")" >> "${GITHUB_ENV}"
 
       - name: Validate release tag
         id: release
