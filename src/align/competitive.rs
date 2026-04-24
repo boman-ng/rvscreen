@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const DEFAULT_BEST_N: i32 = 5;
 const DEFAULT_CAP_KALLOC: i64 = 512 * 1024 * 1024;
@@ -72,6 +73,7 @@ pub struct CompetitiveAligner {
     preset: CompetitivePreset,
     thread_budget: usize,
     kalloc_cap: i64,
+    minimap2_index_load_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +138,8 @@ impl CompetitiveAligner {
         let manifest = load_manifest(&manifest_path)?;
         let (contig_metadata_by_name, virus_targets_by_contig) = build_contig_indexes(&manifest)?;
         let kalloc_cap = per_thread_kalloc_cap(thread_budget);
-        let aligner = build_competitive_aligner(&reference_input, preset, kalloc_cap)?;
+        let (aligner, minimap2_index_load_duration) =
+            build_competitive_aligner(&reference_input, preset, kalloc_cap)?;
 
         Ok(Self {
             aligner: Arc::new(aligner),
@@ -147,6 +150,7 @@ impl CompetitiveAligner {
             preset,
             thread_budget,
             kalloc_cap,
+            minimap2_index_load_duration,
         })
     }
 
@@ -205,6 +209,10 @@ impl CompetitiveAligner {
 
     pub fn kalloc_cap(&self) -> i64 {
         self.kalloc_cap
+    }
+
+    pub fn minimap2_index_load_duration(&self) -> Duration {
+        self.minimap2_index_load_duration
     }
 
     pub fn uses_prebuilt_index(&self) -> bool {
@@ -634,22 +642,26 @@ fn build_competitive_aligner(
     reference_input: &Path,
     preset: CompetitivePreset,
     kalloc_cap: i64,
-) -> Result<Aligner<Built>> {
+) -> Result<(Aligner<Built>, Duration)> {
     let mut builder = match preset {
         CompetitivePreset::SrConservative => Aligner::builder().sr().with_cigar(),
     };
     builder.mapopt.best_n = DEFAULT_BEST_N;
     builder.mapopt.cap_kalloc = kalloc_cap;
 
-    builder.with_index(reference_input, None).map_err(|reason| {
-        RvScreenError::validation(
-            "reference_bundle",
-            format!(
-                "failed to load minimap2 reference input `{}`: {reason}",
-                reference_input.display()
-            ),
-        )
-    })
+    let index_load_started = Instant::now();
+    let aligner = builder
+        .with_index(reference_input, None)
+        .map_err(|reason| {
+            RvScreenError::validation(
+                "reference_bundle",
+                format!(
+                    "failed to load minimap2 reference input `{}`: {reason}",
+                    reference_input.display()
+                ),
+            )
+        })?;
+    Ok((aligner, index_load_started.elapsed()))
 }
 
 fn normalize_thread_budget(threads: usize) -> Result<usize> {
