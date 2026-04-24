@@ -6,14 +6,14 @@ use tempfile::tempdir;
 
 const TASK23_THROUGHPUT_DROP_PCT: f64 = 25.0;
 const TASK23_RSS_INCREASE_PCT: f64 = 35.0;
-const TASK26_ALIGNMENT_DROP_PCT: f64 = 30.0;
+const TASK26_REPRESENTATIVE_ALIGNMENT_DROP_PCT: f64 = 30.0;
 const TASK26_E2E_LATENCY_INCREASE_PCT: f64 = 35.0;
 const TASK26_RSS_INCREASE_PCT: f64 = 35.0;
 const TASK23_MIN_THROUGHPUT_1: f64 = 20_000.0;
 const TASK23_MIN_THROUGHPUT_4: f64 = 80_000.0;
 const TASK23_MAX_RSS_KIB: f64 = 120_000.0;
 const TASK26_MIN_INPUT_THROUGHPUT: f64 = 500_000.0;
-const TASK26_MIN_ALIGNMENT_THROUGHPUT_4: f64 = 8_000_000.0;
+const TASK26_MIN_REPRESENTATIVE_ALIGNMENT_THROUGHPUT_4: f64 = 8_000_000.0;
 const TASK26_MAX_STARTUP_LATENCY_4_MS: f64 = 20.0;
 const TASK26_MAX_E2E_LATENCY_4_MS: f64 = 200.0;
 const TASK26_MAX_RSS_KIB: f64 = 120_000.0;
@@ -53,7 +53,10 @@ fn perf_gate_accepts_current_artifacts_and_small_metric_deltas() {
         "expected current artifact sanity checks to pass, got {sanity_errors:?}"
     );
     let errors = compare_against_base(&base, &current);
-    assert!(errors.is_empty(), "expected no gate failures, got {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "expected no gate failures, got {errors:?}"
+    );
 }
 
 #[test]
@@ -89,19 +92,27 @@ fn perf_gate_rejects_clear_regressions() {
     let errors = compare_against_base(&base, &current);
 
     assert!(
-        sanity_errors.iter().any(|error| error.contains("task23 throughput @4")),
+        sanity_errors
+            .iter()
+            .any(|error| error.contains("task23 throughput @4")),
         "expected task23 current-only guard to fail, got {sanity_errors:?}"
     );
     assert!(
-        errors.iter().any(|error| error.contains("task23 throughput @4")),
+        errors
+            .iter()
+            .any(|error| error.contains("task23 throughput @4")),
         "expected task23 throughput regression, got {errors:?}"
     );
     assert!(
-        errors.iter().any(|error| error.contains("task26 end-to-end latency @4")),
+        errors
+            .iter()
+            .any(|error| error.contains("task26 representative scan+align end-to-end latency @4")),
         "expected task26 latency regression, got {errors:?}"
     );
     assert!(
-        errors.iter().any(|error| error.contains("task23 peak RSS @4")),
+        errors
+            .iter()
+            .any(|error| error.contains("task23 peak RSS @4")),
         "expected task23 RSS regression, got {errors:?}"
     );
 }
@@ -186,15 +197,136 @@ fn load_evidence(dir: &Path) -> Result<EvidenceSet, String> {
     let task23_rss = load_rss_map(&dir.join("task23_rss.tsv"))?;
     let task26_summary = load_summary_map(&dir.join("task26_summary.tsv"))?;
 
-    require_summary(&task23_summary, "throughput", "screen_run_without_report", "1")?;
-    require_summary(&task23_summary, "throughput", "screen_run_without_report", "4")?;
+    require_summary(
+        &task23_summary,
+        "throughput",
+        "screen_run_without_report",
+        "1",
+    )?;
+    require_summary(
+        &task23_summary,
+        "throughput",
+        "screen_run_without_report",
+        "4",
+    )?;
     require_rss(&task23_rss, "peak_rss", "parallel_screen_run", "4")?;
 
     require_summary(&task26_summary, "input_throughput", "fastq_pair_read", "1")?;
-    require_summary(&task26_summary, "alignment_throughput", "competitive_align", "4")?;
-    require_summary(&task26_summary, "startup_latency", "screen_prepare_only", "4")?;
-    require_summary(&task26_summary, "end_to_end_latency", "screen_to_report_bundle", "4")?;
+    require_summary(
+        &task26_summary,
+        "alignment_throughput",
+        "representative_retained_sample_align",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "startup_latency",
+        "representative_aligner_prepare_only",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "startup_latency",
+        "representative_prepare_only",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "end_to_end_latency",
+        "representative_scan_align_report_bundle",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "end_to_end_latency",
+        "representative_execute_only_no_scan_report",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "input_fragments",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "qc_passing_fragments",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "representative_sampled_final",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "representative_round_sampled",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "minimap2_calls",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "io_wall_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "qc_hash_wall_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "align_wall_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "aggregate_wall_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "executor_queue_wait_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "peak_heap_bytes",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_summary(
+        &task26_summary,
+        "aggregate_candidate_count",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
     require_summary(&task26_summary, "peak_rss", "cargo_bench_process_hwm", "-")?;
+    require_positive_metric(
+        &task26_summary,
+        "io_wall_ms",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
+    require_positive_metric(
+        &task26_summary,
+        "peak_heap_bytes",
+        "representative_scan_qc_align_aggregate",
+        "4",
+    )?;
 
     Ok(EvidenceSet {
         task23_summary,
@@ -238,21 +370,21 @@ fn compare_against_base(base: &EvidenceSet, current: &EvidenceSet) -> Vec<String
     );
     compare_throughput(
         &mut errors,
-        "task26 alignment throughput @4",
+        "task26 representative retained-sample alignment throughput @4",
         &base.task26_summary,
         &current.task26_summary,
         "alignment_throughput",
-        "competitive_align",
+        "representative_retained_sample_align",
         "4",
-        TASK26_ALIGNMENT_DROP_PCT,
+        TASK26_REPRESENTATIVE_ALIGNMENT_DROP_PCT,
     );
     compare_latency(
         &mut errors,
-        "task26 end-to-end latency @4",
+        "task26 representative scan+align end-to-end latency @4",
         &base.task26_summary,
         &current.task26_summary,
         "end_to_end_latency",
-        "screen_to_report_bundle",
+        "representative_scan_align_report_bundle",
         "4",
         TASK26_E2E_LATENCY_INCREASE_PCT,
     );
@@ -311,28 +443,28 @@ fn validate_current_absolute_guard(current: &EvidenceSet) -> Vec<String> {
     );
     enforce_minimum_summary(
         &mut errors,
-        "task26 alignment throughput @4",
+        "task26 representative retained-sample alignment throughput @4",
         &current.task26_summary,
         "alignment_throughput",
-        "competitive_align",
+        "representative_retained_sample_align",
         "4",
-        TASK26_MIN_ALIGNMENT_THROUGHPUT_4,
+        TASK26_MIN_REPRESENTATIVE_ALIGNMENT_THROUGHPUT_4,
     );
     enforce_maximum_summary(
         &mut errors,
-        "task26 startup latency @4",
+        "task26 representative prepare-only startup latency @4",
         &current.task26_summary,
         "startup_latency",
-        "screen_prepare_only",
+        "representative_prepare_only",
         "4",
         TASK26_MAX_STARTUP_LATENCY_4_MS,
     );
     enforce_maximum_summary(
         &mut errors,
-        "task26 end-to-end latency @4",
+        "task26 representative scan+align end-to-end latency @4",
         &current.task26_summary,
         "end_to_end_latency",
-        "screen_to_report_bundle",
+        "representative_scan_align_report_bundle",
         "4",
         TASK26_MAX_E2E_LATENCY_4_MS,
     );
@@ -357,7 +489,10 @@ fn load_summary_map(path: &Path) -> Result<BTreeMap<(String, String, String), Su
         .next()
         .ok_or_else(|| format!("{} is empty", path.display()))?;
     if header != "metric\tscenario\tthreads\trepeats\tmean\tunit\tcv_pct" {
-        return Err(format!("unexpected summary header in {}: {header}", path.display()));
+        return Err(format!(
+            "unexpected summary header in {}: {header}",
+            path.display()
+        ));
     }
 
     let mut rows = BTreeMap::new();
@@ -390,7 +525,11 @@ fn load_summary_map(path: &Path) -> Result<BTreeMap<(String, String, String), Su
             unit: parts[5].to_string(),
         };
         rows.insert(
-            (row.metric.clone(), row.scenario.clone(), row.threads.clone()),
+            (
+                row.metric.clone(),
+                row.scenario.clone(),
+                row.threads.clone(),
+            ),
             row,
         );
     }
@@ -405,7 +544,10 @@ fn load_rss_map(path: &Path) -> Result<BTreeMap<(String, String, String), RssRow
         .next()
         .ok_or_else(|| format!("{} is empty", path.display()))?;
     if header != "metric\tscenario\tthreads\tsampled_fragments\tvalue\tunit" {
-        return Err(format!("unexpected RSS header in {}: {header}", path.display()));
+        return Err(format!(
+            "unexpected RSS header in {}: {header}",
+            path.display()
+        ));
     }
 
     let mut rows = BTreeMap::new();
@@ -445,7 +587,11 @@ fn load_rss_map(path: &Path) -> Result<BTreeMap<(String, String, String), RssRow
             unit: parts[5].to_string(),
         };
         rows.insert(
-            (row.metric.clone(), row.scenario.clone(), row.threads.clone()),
+            (
+                row.metric.clone(),
+                row.scenario.clone(),
+                row.threads.clone(),
+            ),
             row,
         );
     }
@@ -458,12 +604,42 @@ fn require_summary(
     scenario: &str,
     threads: &str,
 ) -> Result<(), String> {
-    let key = (metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let row = rows
         .get(&key)
         .ok_or_else(|| format!("missing summary row {:?}", key))?;
     if !(row.mean.is_finite() && row.mean > 0.0) {
-        return Err(format!("summary row {:?} must have a positive finite mean", key));
+        return Err(format!(
+            "summary row {:?} must have a positive finite mean",
+            key
+        ));
+    }
+    Ok(())
+}
+
+fn require_positive_metric(
+    rows: &BTreeMap<(String, String, String), SummaryRow>,
+    metric: &str,
+    scenario: &str,
+    threads: &str,
+) -> Result<(), String> {
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
+    let row = rows
+        .get(&key)
+        .ok_or_else(|| format!("missing summary row {:?}", key))?;
+    if !(row.mean.is_finite() && row.mean > 0.0) {
+        return Err(format!(
+            "summary row {:?} must be strictly positive to prove the metric is wired meaningfully",
+            key
+        ));
     }
     Ok(())
 }
@@ -474,7 +650,11 @@ fn require_rss(
     scenario: &str,
     threads: &str,
 ) -> Result<(), String> {
-    let key = (metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let row = rows
         .get(&key)
         .ok_or_else(|| format!("missing RSS row {:?}", key))?;
@@ -482,7 +662,10 @@ fn require_rss(
         return Err(format!("RSS row {:?} must record sampled fragments", key));
     }
     if !(row.value.is_finite() && row.value > 0.0) {
-        return Err(format!("RSS row {:?} must have a positive finite value", key));
+        return Err(format!(
+            "RSS row {:?} must have a positive finite value",
+            key
+        ));
     }
     Ok(())
 }
@@ -497,7 +680,11 @@ fn compare_throughput(
     threads: &str,
     max_drop_pct: f64,
 ) {
-    let key = &(metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = &(
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let base_row = &base[key];
     let current_row = &current[key];
     let min_allowed = base_row.mean * (1.0 - max_drop_pct / 100.0);
@@ -519,7 +706,11 @@ fn compare_latency(
     threads: &str,
     max_increase_pct: f64,
 ) {
-    let key = &(metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = &(
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let base_row = &base[key];
     let current_row = &current[key];
     let max_allowed = base_row.mean * (1.0 + max_increase_pct / 100.0);
@@ -563,7 +754,11 @@ fn compare_rss(
     threads: &str,
     max_increase_pct: f64,
 ) {
-    let key = &(metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = &(
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let base_row = &base[key];
     let current_row = &current[key];
     let max_allowed = base_row.value * (1.0 + max_increase_pct / 100.0);
@@ -584,7 +779,11 @@ fn enforce_minimum_summary(
     threads: &str,
     minimum: f64,
 ) {
-    let key = (metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let row = &rows[&key];
     if row.mean < minimum {
         errors.push(format!(
@@ -603,7 +802,11 @@ fn enforce_maximum_summary(
     threads: &str,
     maximum: f64,
 ) {
-    let key = (metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let row = &rows[&key];
     if row.mean > maximum {
         errors.push(format!(
@@ -622,7 +825,11 @@ fn enforce_maximum_rss(
     threads: &str,
     maximum: f64,
 ) {
-    let key = (metric.to_string(), scenario.to_string(), threads.to_string());
+    let key = (
+        metric.to_string(),
+        scenario.to_string(),
+        threads.to_string(),
+    );
     let row = &rows[&key];
     if row.value > maximum {
         errors.push(format!(
@@ -644,6 +851,7 @@ fn write_task23_summary(
     task26_rss: f64,
 ) {
     fs::create_dir_all(dir).expect("fixture directory should build");
+    let execute_only_latency = (e2e_latency - startup_latency).max(1.0);
 
     let mut task23_body = String::from("metric\tscenario\tthreads\trepeats\tmean\tunit\tcv_pct\n");
     for (threads, mean) in task23_throughput {
@@ -667,10 +875,24 @@ fn write_task23_summary(
         format!(
             "metric\tscenario\tthreads\trepeats\tmean\tunit\tcv_pct\n\
 input_throughput\tfastq_pair_read\t1\t3\t{input_throughput:.3}\tpairs/s\t1.000\n\
-alignment_throughput\tcompetitive_align\t4\t3\t{alignment_throughput:.3}\tpairs/s\t1.000\n\
-startup_latency\tscreen_prepare_only\t4\t2\t{startup_latency:.3}\tms\t1.000\n\
-end_to_end_latency\tscreen_to_report_bundle\t4\t2\t{e2e_latency:.3}\tms\t1.000\n\
-peak_rss\tcargo_bench_process_hwm\t-\t1\t{task26_rss:.3}\tKiB\t0.000\n"
+alignment_throughput\trepresentative_retained_sample_align\t4\t3\t{alignment_throughput:.3}\tpairs/s\t1.000\n\
+startup_latency\trepresentative_aligner_prepare_only\t4\t2\t{startup_latency:.3}\tms\t1.000\n\
+startup_latency\trepresentative_prepare_only\t4\t2\t{startup_latency:.3}\tms\t1.000\n\
+end_to_end_latency\trepresentative_scan_align_report_bundle\t4\t2\t{e2e_latency:.3}\tms\t1.000\n\
+end_to_end_latency\trepresentative_execute_only_no_scan_report\t4\t2\t{execute_only_latency:.3}\tms\t1.000\n\
+peak_rss\tcargo_bench_process_hwm\t-\t1\t{task26_rss:.3}\tKiB\t0.000\n\
+input_fragments\trepresentative_scan_qc_align_aggregate\t4\t2\t10000.000\tfragments\t0.000\n\
+qc_passing_fragments\trepresentative_scan_qc_align_aggregate\t4\t2\t10000.000\tfragments\t0.000\n\
+representative_sampled_final\trepresentative_scan_qc_align_aggregate\t4\t2\t10000.000\tfragments\t0.000\n\
+representative_round_sampled\trepresentative_scan_qc_align_aggregate\t4\t2\t10000.000\tfragments\t0.000\n\
+minimap2_calls\trepresentative_scan_qc_align_aggregate\t4\t2\t10000.000\tcalls\t0.000\n\
+io_wall_ms\trepresentative_scan_qc_align_aggregate\t4\t2\t10.000\tms\t1.000\n\
+qc_hash_wall_ms\trepresentative_scan_qc_align_aggregate\t4\t2\t6.000\tms\t1.000\n\
+align_wall_ms\trepresentative_scan_qc_align_aggregate\t4\t2\t20.000\tms\t1.000\n\
+aggregate_wall_ms\trepresentative_scan_qc_align_aggregate\t4\t2\t5.000\tms\t1.000\n\
+executor_queue_wait_ms\trepresentative_scan_qc_align_aggregate\t4\t2\t1.000\tms\t1.000\n\
+peak_heap_bytes\trepresentative_scan_qc_align_aggregate\t4\t2\t1024.000\tbytes\t0.000\n\
+aggregate_candidate_count\trepresentative_scan_qc_align_aggregate\t4\t2\t2.000\tcandidates\t0.000\n"
         ),
     )
     .expect("task26 summary fixture should write");

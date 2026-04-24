@@ -81,8 +81,22 @@ fn integration_pure_negative_sample_is_final_negative() {
         rvscreen::types::DecisionStatus::Negative
     );
     assert_eq!(summary.release_status, ReleaseStatus::Final);
+    assert_eq!(summary.sampled_fragments, 100);
+    assert_eq!(summary.qc_passing_fragments, 200);
     assert_report_bundle_artifacts(&out_dir);
     assert_candidate_accessions(&out_dir, &[]);
+    let rounds = read_round_rows(&out_dir);
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![50, 100]
+    );
+    assert_eq!(
+        rounds.last().map(|round| round.sampled_fragments),
+        Some(summary.sampled_fragments)
+    );
     assert!(coverage_file_map(&out_dir).is_empty());
 }
 
@@ -140,8 +154,42 @@ fn integration_high_titer_positive_sample_is_final_positive() {
         rvscreen::types::DecisionStatus::Positive
     );
     assert_eq!(summary.release_status, ReleaseStatus::Final);
+    assert_eq!(summary.sampled_fragments, 50);
+    assert_eq!(summary.qc_passing_fragments, 200);
     assert_report_bundle_artifacts(&out_dir);
     assert_candidate_accessions(&out_dir, &["NC_SYNTHV1.1"]);
+    let rounds = read_round_rows(&out_dir);
+    assert_eq!(rounds.len(), 1);
+    assert!(
+        rounds
+            .iter()
+            .all(|round| round.sampled_fragments <= summary.qc_passing_fragments),
+        "representative cumulative rounds must not exceed QC-pass fragments"
+    );
+    assert_eq!(rounds[0].sampled_fragments, 50);
+    assert_eq!(
+        rounds.last().map(|round| round.sampled_fragments),
+        Some(summary.sampled_fragments)
+    );
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|round| round.decision_status.as_str())
+            .collect::<Vec<_>>(),
+        vec!["positive"]
+    );
+    let candidates = read_candidate_rows(&out_dir);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].accession_or_group, "NC_SYNTHV1.1");
+    assert!(candidates[0].accepted_fragments > 0);
+    assert_eq!(rounds[0].accepted_virus, candidates[0].accepted_fragments);
+    assert!((candidates[0].raw_fraction - candidates[0].unique_fraction).abs() < 1e-12);
+    assert!(
+        (candidates[0].unique_fraction
+            - (candidates[0].accepted_fragments as f64 / summary.sampled_fragments as f64))
+            .abs()
+            < 1e-12
+    );
     assert_eq!(
         coverage_file_map(&out_dir)
             .keys()
@@ -213,7 +261,21 @@ fn integration_low_titer_positive_sample_stays_detectable() {
         summary.decision_status
     );
     assert_eq!(summary.release_status, ReleaseStatus::Final);
+    assert_eq!(summary.sampled_fragments, 10_000);
+    assert_eq!(summary.qc_passing_fragments, 10_000);
     assert_report_bundle_artifacts(&out_dir);
+    let rounds = read_round_rows(&out_dir);
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![5_000, 10_000]
+    );
+    assert_eq!(
+        rounds.last().map(|round| round.sampled_fragments),
+        Some(summary.sampled_fragments)
+    );
     let candidate_rows = read_candidate_rows(&out_dir);
     assert!(
         candidate_rows.len() <= 1,
@@ -221,6 +283,13 @@ fn integration_low_titer_positive_sample_stays_detectable() {
     );
     if let Some(candidate) = candidate_rows.first() {
         assert_eq!(candidate.accession_or_group, "NC_SYNTHV1.1");
+        assert!((candidate.raw_fraction - candidate.unique_fraction).abs() < 1e-12);
+        assert!(
+            (candidate.unique_fraction
+                - (candidate.accepted_fragments as f64 / summary.sampled_fragments as f64))
+                .abs()
+                < 1e-12
+        );
     }
 }
 
@@ -279,8 +348,33 @@ fn integration_multi_virus_sample_reports_two_candidates() {
     let summary = read_summary(&out_dir);
     assert_eq!(summary.decision_status, DecisionStatus::Positive);
     assert_eq!(summary.release_status, ReleaseStatus::Final);
+    assert_eq!(summary.sampled_fragments, 50);
+    assert_eq!(summary.qc_passing_fragments, 200);
     assert_report_bundle_artifacts(&out_dir);
     assert_candidate_accessions(&out_dir, &["NC_SYNTHV1.1", "NC_SYNTHV2.1"]);
+    let rounds = read_round_rows(&out_dir);
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].sampled_fragments, summary.sampled_fragments);
+    let candidate_rows = read_candidate_rows(&out_dir);
+    assert_eq!(candidate_rows.len(), 2);
+    assert_eq!(
+        rounds[0].accepted_virus,
+        candidate_rows
+            .iter()
+            .map(|candidate| candidate.accepted_fragments)
+            .sum::<u64>()
+    );
+    for candidate in &candidate_rows {
+        assert!((candidate.raw_fraction - candidate.unique_fraction).abs() < 1e-12);
+        assert!(
+            (candidate.unique_fraction
+                - (candidate.accepted_fragments as f64 / summary.sampled_fragments as f64))
+                .abs()
+                < 1e-12,
+            "candidate {} should use sampled-domain representative denominator",
+            candidate.accession_or_group
+        );
+    }
     assert_eq!(
         coverage_file_map(&out_dir)
             .keys()
@@ -601,6 +695,164 @@ fn integration_reproducibility_same_seed_same_outputs() {
 }
 
 #[test]
+fn integration_representative_same_seed_is_deterministic_across_thread_counts() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-thread-reproducibility"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("calibration profile should be written");
+    let negative_control =
+        write_negative_control(tempdir.path().join("negative-control.json"), "pass", &[])
+            .expect("negative control should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 8401)
+            .with_output_dir(tempdir.path().join("fastq-thread-reproducibility"))
+            .with_components(vec![
+                ReadComponent::new(SyntheticSource::Human, 0.95),
+                ReadComponent::new(
+                    SyntheticSource::Virus(VirusSelector::Accession("NC_SYNTHV1.1".to_string())),
+                    0.05,
+                ),
+            ]),
+    )
+    .expect("FASTQ should be generated");
+
+    let single_thread_out = tempdir.path().join("report-thread-1");
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.clone().into_os_string(),
+        r2.clone().into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.clone().into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.clone().into_os_string(),
+        os("--negative-control"),
+        negative_control.clone().into_os_string(),
+        os("--out"),
+        single_thread_out.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+        os("--threads"),
+        os("1"),
+    ]);
+
+    let multi_thread_out = tempdir.path().join("report-thread-4");
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--negative-control"),
+        negative_control.into_os_string(),
+        os("--out"),
+        multi_thread_out.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+        os("--threads"),
+        os("4"),
+    ]);
+
+    assert_eq!(
+        read_summary(&single_thread_out),
+        read_summary(&multi_thread_out)
+    );
+    assert_eq!(
+        read_round_rows(&single_thread_out),
+        read_round_rows(&multi_thread_out)
+    );
+    assert_eq!(
+        read_candidate_rows(&single_thread_out),
+        read_candidate_rows(&multi_thread_out)
+    );
+    assert_eq!(
+        coverage_file_map(&single_thread_out),
+        coverage_file_map(&multi_thread_out)
+    );
+}
+
+#[test]
+fn integration_representative_small_input_caps_rounds_at_available_qc_fragments() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-small-input"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![50, 100],
+            max_rounds: 2,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("calibration profile should be written");
+    let negative_control =
+        write_negative_control(tempdir.path().join("negative-control.json"), "pass", &[])
+            .expect("negative control should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(12, 100, 8402)
+            .with_output_dir(tempdir.path().join("fastq-small-input"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("small-input FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-small-input");
+
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--negative-control"),
+        negative_control.into_os_string(),
+        os("--out"),
+        out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+    ]);
+
+    let summary = read_summary(&out_dir);
+    assert_eq!(summary.input_fragments, 12);
+    assert_eq!(summary.qc_passing_fragments, 12);
+    assert_eq!(summary.sampled_fragments, 12);
+    let rounds = read_round_rows(&out_dir);
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![12, 12]
+    );
+    assert_eq!(
+        rounds.last().map(|round| round.sampled_fragments),
+        Some(summary.sampled_fragments)
+    );
+    assert!(
+        rounds
+            .iter()
+            .all(|round| round.sampled_fragments <= summary.qc_passing_fragments),
+        "representative rounds must cap at available QC-pass fragments"
+    );
+    assert!(read_candidate_rows(&out_dir).is_empty());
+}
+
+#[test]
 fn integration_full_chain_ref_build_calibrate_screen_audit_verify() {
     let tempdir = tempdir().expect("tempdir should be created");
     let bundle = prepare_reference_bundle_via_cli(tempdir.path())
@@ -698,7 +950,8 @@ fn integration_full_chain_ref_build_calibrate_screen_audit_verify() {
 #[test]
 fn integration_full_chain_report_manifest_keeps_sampling_and_negative_control_provenance() {
     let tempdir = tempdir().expect("tempdir should be created");
-    let bundle = prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
     let calibration_dir = write_calibration_profile(
         tempdir.path().join("calibration-manifest-provenance"),
         &bundle.version,
@@ -753,16 +1006,26 @@ fn integration_full_chain_report_manifest_keeps_sampling_and_negative_control_pr
     .expect("run_manifest.json should parse");
     assert_eq!(manifest.sampling_mode, "representative");
     assert_eq!(manifest.negative_control.required, true);
-    assert_eq!(manifest.negative_control.status, NegativeControlStatus::Pass);
-    assert_eq!(manifest.negative_control.control_id.as_deref(), Some("neg-001"));
-    assert_eq!(manifest.negative_control.control_status.as_deref(), Some("pass"));
+    assert_eq!(
+        manifest.negative_control.status,
+        NegativeControlStatus::Pass
+    );
+    assert_eq!(
+        manifest.negative_control.control_id.as_deref(),
+        Some("neg-001")
+    );
+    assert_eq!(
+        manifest.negative_control.control_status.as_deref(),
+        Some("pass")
+    );
     assert!(out_dir.join("checksum.sha256").exists());
 }
 
 #[test]
 fn integration_streaming_required_negative_control_missing_is_blocked_not_collapsed() {
     let tempdir = tempdir().expect("tempdir should be created");
-    let bundle = prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
     let calibration_dir = write_calibration_profile(
         tempdir.path().join("calibration-streaming-blocked"),
         &bundle.version,
@@ -816,7 +1079,10 @@ fn integration_streaming_required_negative_control_missing_is_blocked_not_collap
     .expect("run_manifest.json should parse");
     assert_eq!(manifest.sampling_mode, "streaming");
     assert_eq!(manifest.negative_control.required, true);
-    assert_eq!(manifest.negative_control.status, NegativeControlStatus::Missing);
+    assert_eq!(
+        manifest.negative_control.status,
+        NegativeControlStatus::Missing
+    );
 }
 
 #[test]
@@ -1057,8 +1323,7 @@ fn write_calibration_profile_stub(dir: &Path, reference_version: &str) -> io::Re
             },
         })
         .map_err(io_other)?,
-    )
-    ?;
+    )?;
     fs::write(
         dir.join("release_gate.json"),
         serde_json::to_vec_pretty(&passing_release_gate()).map_err(io_other)?,
@@ -1074,7 +1339,7 @@ fn audit_sample_summary(reference_version: &str) -> SampleSummary {
         seed: 20_260_421,
         input_fragments: 100_000,
         qc_passing_fragments: 95_000,
-        sampled_fragments: 50_000,
+        sampled_fragments: 100_000,
         rounds_run: 2,
         stop_reason: StopReason::PositiveBoundaryCrossed,
         decision_status: DecisionStatus::Positive,
@@ -1082,24 +1347,24 @@ fn audit_sample_summary(reference_version: &str) -> SampleSummary {
     }
 }
 
-    fn audit_run_manifest(reference_version: &str) -> RunManifest {
-        RunManifest {
-            reference_bundle_version: reference_version.to_string(),
-            calibration_profile_version: "rvscreen_calib_2026.04.21-r1".to_string(),
-            backend: "minimap2".to_string(),
-            seed: 20_260_421,
-            sampling_mode: "representative".to_string(),
-            negative_control: NegativeControlManifest {
-                required: false,
-                status: NegativeControlStatus::Pass,
-                control_id: Some("neg-001".to_string()),
-                control_status: Some("pass".to_string()),
-            },
-            input_files: vec![
-                "reads_R1.fastq.gz".to_string(),
-                "reads_R2.fastq.gz".to_string(),
-            ],
-        }
+fn audit_run_manifest(reference_version: &str) -> RunManifest {
+    RunManifest {
+        reference_bundle_version: reference_version.to_string(),
+        calibration_profile_version: "rvscreen_calib_2026.04.21-r1".to_string(),
+        backend: "minimap2".to_string(),
+        seed: 20_260_421,
+        sampling_mode: "representative".to_string(),
+        negative_control: NegativeControlManifest {
+            required: false,
+            status: NegativeControlStatus::Pass,
+            control_id: Some("neg-001".to_string()),
+            control_status: Some("pass".to_string()),
+        },
+        input_files: vec![
+            "reads_R1.fastq.gz".to_string(),
+            "reads_R2.fastq.gz".to_string(),
+        ],
+    }
 }
 
 fn audit_rounds() -> Vec<RoundRecord> {
@@ -1125,7 +1390,7 @@ fn audit_candidate_calls() -> Vec<CandidateCall> {
         accepted_fragments: 12,
         nonoverlap_fragments: 4,
         raw_fraction: 0.00012,
-        unique_fraction: 0.00013,
+        unique_fraction: 12.0 / 100_000.0,
         fraction_ci_95: [0.00008, 0.00018],
         clopper_pearson_upper: 0.0002,
         breadth: 0.01,
@@ -1430,12 +1695,22 @@ fn read_summary(report_dir: &Path) -> SampleSummary {
     .expect("sample summary JSON should parse")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct CandidateRow {
     accession_or_group: String,
+    accepted_fragments: u64,
+    raw_fraction: f64,
+    unique_fraction: f64,
     decision: String,
     background_ratio: f64,
     decision_reasons: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct RoundRow {
+    sampled_fragments: u64,
+    accepted_virus: u64,
+    decision_status: String,
 }
 
 fn read_candidate_rows(report_dir: &Path) -> Vec<CandidateRow> {
@@ -1446,6 +1721,16 @@ fn read_candidate_rows(report_dir: &Path) -> Vec<CandidateRow> {
         .deserialize()
         .collect::<Result<Vec<_>, _>>()
         .expect("candidate_calls.tsv rows should deserialize")
+}
+
+fn read_round_rows(report_dir: &Path) -> Vec<RoundRow> {
+    ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_path(report_dir.join("rounds.tsv"))
+        .expect("rounds.tsv should be readable")
+        .deserialize()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rounds.tsv rows should deserialize")
 }
 
 fn assert_candidate_accessions(report_dir: &Path, expected: &[&str]) {
@@ -1594,8 +1879,8 @@ mod cross_format_reader_contract {
         fasta::{self, repository::adapters::IndexedReader},
         sam::{
             self,
-            alignment::{RecordBuf, io::Write as _},
-            header::record::value::{Map, map::ReferenceSequence},
+            alignment::{io::Write as _, RecordBuf},
+            header::record::value::{map::ReferenceSequence, Map},
         },
     };
     use rvscreen::io::{FragmentReaderFactory, FragmentRecord, ScreenInput};
@@ -1679,7 +1964,10 @@ mod cross_format_reader_contract {
                 .expect("first fragment should exist")
                 .expect("first fragment should decode");
             assert_eq!(first.fragment_key, "READ:1:FCX123:1:1101:1000:2000");
-            assert!(reader.next().is_none(), "fixture should contain exactly one fragment");
+            assert!(
+                reader.next().is_none(),
+                "fixture should contain exactly one fragment"
+            );
         }
     }
 
@@ -1867,7 +2155,9 @@ mod cross_format_reader_contract {
         let file = File::create(path)?;
         let mut writer = bam::io::Writer::new(file);
 
-        writer.get_mut().write_all(&encode_bam_header(BAM_MAGIC_NUMBER))?;
+        writer
+            .get_mut()
+            .write_all(&encode_bam_header(BAM_MAGIC_NUMBER))?;
         for record in records {
             writer.get_mut().write_all(&encode_bam_record(record)?)?;
         }
