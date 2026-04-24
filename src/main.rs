@@ -49,8 +49,21 @@ fn main() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Screen(args) => {
+        Commands::Run(args) | Commands::Screen(args) => {
             let outcome = run_screen(&args)?;
+            for warning in &outcome.sampling_warnings {
+                let round = warning
+                    .round
+                    .map(|round| round.to_string())
+                    .unwrap_or_else(|| "all".to_string());
+                writeln!(
+                    io::stderr(),
+                    "rvscreen_warning kind={} round={} message={:?}",
+                    warning.kind.as_str(),
+                    round,
+                    warning.message
+                )?;
+            }
             info!(
                 sample_id = %outcome.summary.sample_id,
                 decision_status = ?outcome.summary.decision_status,

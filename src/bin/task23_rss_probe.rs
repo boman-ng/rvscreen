@@ -93,6 +93,9 @@ impl ProbeFixture {
             negative_control: None,
             out,
             mode: ScreenMode::Representative,
+            rounds: None,
+            round_proportions: None,
+            allow_sampling_threshold_override: false,
             threads,
         }
     }
