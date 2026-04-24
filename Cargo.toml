@@ -41,9 +41,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]
-name = "task23_parallel_screen"
+name = "representative_screen"
 harness = false
 
 [[bench]]
-name = "task26_perf"
+name = "representative_perf"
 harness = false
