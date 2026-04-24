@@ -1,4 +1,4 @@
-use super::spool::RepresentativeRoundSpool;
+use super::spool::{RepresentativeBatchDelta, RepresentativeRoundSpool};
 use crate::adjudicate::{AdjudicationInputs, FragmentAdjudicator};
 use crate::aggregate::CandidateAggregator;
 use crate::align::{CompetitiveAligner, FragmentAlignResult};
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, SyncSender, sync_channel},
+    mpsc::{sync_channel, Receiver, SyncSender},
     Arc, Condvar, Mutex,
 };
 use std::thread::{self, ScopedJoinHandle};
@@ -34,10 +34,9 @@ struct RepresentativeSubmission {
     fragment: IoFragmentRecord,
 }
 
-struct RepresentativeProcessedFragment {
-    entry_round: usize,
-    class: FragmentClass,
-    align_result: FragmentAlignResult,
+struct RepresentativeBatch {
+    batch_sequence: usize,
+    submissions: Vec<RepresentativeSubmission>,
 }
 
 struct Sequenced<T> {
@@ -84,8 +83,8 @@ pub(crate) struct RoundExecutor<'scope> {
 pub(crate) struct RepresentativeRoundExecutor<'scope> {
     inner: OrderedExecutor<
         'scope,
-        RepresentativeSubmission,
-        RepresentativeProcessedFragment,
+        RepresentativeBatch,
+        RepresentativeBatchDelta,
         RepresentativeRoundSpool,
     >,
 }
@@ -107,6 +106,10 @@ impl RoundParallelism {
 
     pub(crate) fn threads(&self) -> usize {
         self.threads
+    }
+
+    pub(crate) fn representative_batch_size(&self) -> usize {
+        self.batch_size
     }
 
     pub(crate) fn start_round_executor<'scope>(
@@ -139,22 +142,17 @@ impl RoundParallelism {
         adjudicator: &'scope FragmentAdjudicator,
         spool: RepresentativeRoundSpool,
     ) -> RepresentativeRoundExecutor<'scope> {
-        let work_capacity = self.batch_size;
-        let result_capacity = self.batch_size;
+        let round_count = spool.round_count();
+        let work_capacity = self.threads.max(1);
+        let result_capacity = self.threads.max(1);
         let inner = OrderedExecutor::new(
             scope,
             self.threads,
             work_capacity,
             result_capacity,
-            move |submission| process_representative_fragment(submission, aligner, adjudicator),
+            move |batch| process_representative_batch(batch, round_count, aligner, adjudicator),
             spool,
-            |spool, processed| {
-                spool.record_processed_fragment(
-                    processed.entry_round,
-                    processed.class,
-                    &processed.align_result,
-                )
-            },
+            |spool, batch_delta| spool.merge_batch_delta(batch_delta),
         );
 
         RepresentativeRoundExecutor { inner }
@@ -172,17 +170,22 @@ impl<'scope> RoundExecutor<'scope> {
 }
 
 impl<'scope> RepresentativeRoundExecutor<'scope> {
-    pub(crate) fn submit(
+    pub(crate) fn submit_batch(
         &self,
-        sequence: usize,
-        entry_round: usize,
-        fragment: IoFragmentRecord,
+        batch_sequence: usize,
+        fragments: Vec<(usize, IoFragmentRecord)>,
     ) -> Result<()> {
         self.inner.submit(
-            sequence,
-            RepresentativeSubmission {
-                entry_round,
-                fragment,
+            batch_sequence,
+            RepresentativeBatch {
+                batch_sequence,
+                submissions: fragments
+                    .into_iter()
+                    .map(|(entry_round, fragment)| RepresentativeSubmission {
+                        entry_round,
+                        fragment,
+                    })
+                    .collect(),
             },
         )
     }
@@ -239,9 +242,7 @@ impl<T> WorkQueue<T> {
             .iter()
             .map(|capacity| VecDeque::with_capacity(*capacity))
             .collect();
-        let worker_ready = (0..worker_count.max(1))
-            .map(|_| Condvar::new())
-            .collect();
+        let worker_ready = (0..worker_count.max(1)).map(|_| Condvar::new()).collect();
 
         Self {
             state: Mutex::new(WorkQueueState {
@@ -417,10 +418,8 @@ where
     }
 
     fn submit(&self, sequence: usize, payload: In) -> Result<()> {
-        self.work_queue.submit(
-            Sequenced { sequence, payload },
-            self.failure.as_ref(),
-        )
+        self.work_queue
+            .submit(Sequenced { sequence, payload }, self.failure.as_ref())
     }
 
     fn finish(mut self) -> Result<SinkState> {
@@ -495,18 +494,24 @@ fn process_fragment(
     })
 }
 
-fn process_representative_fragment(
-    submission: RepresentativeSubmission,
+fn process_representative_batch(
+    batch: RepresentativeBatch,
+    round_count: usize,
     aligner: &CompetitiveAligner,
     adjudicator: &FragmentAdjudicator,
-) -> Result<RepresentativeProcessedFragment> {
-    let processed = process_fragment(submission.fragment, aligner, adjudicator)?;
+) -> Result<RepresentativeBatchDelta> {
+    let mut batch_delta = RepresentativeBatchDelta::new(batch.batch_sequence, round_count);
 
-    Ok(RepresentativeProcessedFragment {
-        entry_round: submission.entry_round,
-        class: processed.class,
-        align_result: processed.align_result,
-    })
+    for submission in batch.submissions {
+        let processed = process_fragment(submission.fragment, aligner, adjudicator)?;
+        batch_delta.record_processed_fragment(
+            submission.entry_round,
+            processed.class,
+            &processed.align_result,
+        )?;
+    }
+
+    Ok(batch_delta)
 }
 
 fn batch_size_for(threads: usize) -> usize {
@@ -670,9 +675,9 @@ fn send_result<T>(
     disconnected_reason: &str,
     failure: &SharedFailure,
 ) -> Result<()> {
-    sender.send(item).map_err(|_| {
-        failure.stage_error("bounded topology channel closed", disconnected_reason)
-    })
+    sender
+        .send(item)
+        .map_err(|_| failure.stage_error("bounded topology channel closed", disconnected_reason))
 }
 
 #[cfg(test)]
@@ -849,7 +854,9 @@ mod tests {
                 "blocked submit should wait until the worker failure is observed"
             );
             assert!(
-                submit_error.to_string().contains("intentional worker failure"),
+                submit_error
+                    .to_string()
+                    .contains("intentional worker failure"),
                 "submit error should include the original worker failure: {submit_error}"
             );
 
@@ -857,7 +864,9 @@ mod tests {
                 .finish()
                 .expect_err("finish should surface the worker failure");
             assert!(
-                finish_error.to_string().contains("intentional worker failure"),
+                finish_error
+                    .to_string()
+                    .contains("intentional worker failure"),
                 "finish error should include the original worker failure: {finish_error}"
             );
 
