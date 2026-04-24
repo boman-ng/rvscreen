@@ -17,17 +17,13 @@ pub struct ProportionEstimate {
 }
 
 impl ProportionEstimate {
-    pub fn from_counts(
-        accepted_fragments: u64,
-        total_sampled_fragments: u64,
-        qc_passing_fragments: u64,
-    ) -> Self {
+    pub fn from_counts(accepted_fragments: u64, total_sampled_fragments: u64) -> Self {
         let raw_fraction = ratio(accepted_fragments, total_sampled_fragments);
-        let unique_fraction = ratio(accepted_fragments, qc_passing_fragments);
+        let unique_fraction = raw_fraction;
         let [wilson_ci_lower, wilson_ci_upper] =
-            wilson_ci_95(accepted_fragments, qc_passing_fragments);
+            wilson_ci_95(accepted_fragments, total_sampled_fragments);
         let clopper_pearson_upper =
-            clopper_pearson_upper_95_one_sided(accepted_fragments, qc_passing_fragments);
+            clopper_pearson_upper_95_one_sided(accepted_fragments, total_sampled_fragments);
 
         Self {
             raw_fraction,
@@ -112,7 +108,7 @@ mod tests {
 
     #[test]
     fn wilson_ci_matches_known_value() {
-        let estimate = ProportionEstimate::from_counts(50, 10_000, 10_000);
+        let estimate = ProportionEstimate::from_counts(50, 10_000);
 
         assert!((estimate.raw_fraction - 0.005).abs() < 1e-12);
         assert!((estimate.unique_fraction - 0.005).abs() < 1e-12);
@@ -124,7 +120,7 @@ mod tests {
 
     #[test]
     fn zero_successes_keep_unique_fraction_and_lower_bound_zero() {
-        let estimate = ProportionEstimate::from_counts(0, 100_000, 100_000);
+        let estimate = ProportionEstimate::from_counts(0, 100_000);
 
         assert_eq!(estimate.raw_fraction, 0.0);
         assert_eq!(estimate.unique_fraction, 0.0);
@@ -136,15 +132,28 @@ mod tests {
 
     #[test]
     fn clopper_pearson_upper_for_zero_successes_matches_reference() {
-        let estimate = ProportionEstimate::from_counts(0, 400_000, 400_000);
+        let estimate = ProportionEstimate::from_counts(0, 400_000);
 
         assert!((estimate.clopper_pearson_upper - 7.489_302_638_941_098e-6).abs() < 1e-10);
     }
 
     #[test]
     fn clopper_pearson_upper_for_very_low_count_matches_reference() {
-        let estimate = ProportionEstimate::from_counts(1, 10_000, 10_000);
+        let estimate = ProportionEstimate::from_counts(1, 10_000);
 
         assert!((estimate.clopper_pearson_upper - 4.742_976_591_654_568_5e-4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn denominator_uses_sampled_fragments_for_unique_fraction_and_intervals() {
+        let estimate = ProportionEstimate::from_counts(2, 5);
+
+        assert!((estimate.raw_fraction - 0.4).abs() < 1e-12);
+        assert!((estimate.unique_fraction - 0.4).abs() < 1e-12);
+        assert_eq!(estimate.fraction_ci_95(), wilson_ci_95(2, 5));
+        assert_eq!(
+            estimate.clopper_pearson_upper,
+            clopper_pearson_upper_95_one_sided(2, 5)
+        );
     }
 }

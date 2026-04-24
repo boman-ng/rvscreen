@@ -389,6 +389,28 @@ mod tests {
             .any(|reason| reason == "unique_fraction_between_boundaries"));
     }
 
+    #[test]
+    fn thresholds_continue_to_use_unique_fraction_after_denominator_fix() {
+        let engine = decision_engine();
+        let outcome = engine.decide(
+            &[candidate_call()
+                .with_raw_fraction(0.0)
+                .with_unique_fraction(0.001)
+                .with_nonoverlap_fragments(10)
+                .with_breadth(0.01)
+                .with_background_ratio(5.0)
+                .with_counts(10, 0)
+                .build()],
+            &DecisionContext::new(1, 5),
+        );
+
+        assert_eq!(outcome.status, DecisionStatus::Positive);
+        assert_eq!(
+            outcome.stop_reason,
+            Some(StopReason::PositiveBoundaryCrossed)
+        );
+    }
+
     fn decision_engine() -> DecisionEngine {
         DecisionEngine::new(
             &DecisionRules {
@@ -437,6 +459,11 @@ mod tests {
 
         fn with_unique_fraction(mut self, unique_fraction: f64) -> Self {
             self.inner.unique_fraction = unique_fraction;
+            self
+        }
+
+        fn with_raw_fraction(mut self, raw_fraction: f64) -> Self {
+            self.inner.raw_fraction = raw_fraction;
             self
         }
 
