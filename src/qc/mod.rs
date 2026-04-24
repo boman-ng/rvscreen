@@ -112,6 +112,30 @@ impl QcResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheapQcPass {
+    pub n_fraction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheapQcResult {
+    Pass(CheapQcPass),
+    Filtered(QcFailure),
+}
+
+impl CheapQcResult {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass(_))
+    }
+
+    pub fn reason(&self) -> Option<&QcFilterReason> {
+        match self {
+            Self::Pass(_) => None,
+            Self::Filtered(failure) => Some(&failure.reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QcPass {
     pub n_fraction: f64,
@@ -158,16 +182,28 @@ pub struct QcStats {
 
 impl QcStats {
     pub fn record(&mut self, result: &QcResult) {
-        self.total_fragments += 1;
+        self.record_total_fragment();
 
         match result {
-            QcResult::Pass(_) => self.passed_fragments += 1,
-            QcResult::Filtered(failure) => match &failure.reason {
-                QcFilterReason::PairIncomplete { .. } => self.pair_incomplete += 1,
-                QcFilterReason::LengthOutOfBounds { .. } => self.length_filtered += 1,
-                QcFilterReason::NContent { .. } => self.n_content_filtered += 1,
-                QcFilterReason::LowComplexity { .. } => self.low_complexity_filtered += 1,
-            },
+            QcResult::Pass(_) => self.record_passed_fragment(),
+            QcResult::Filtered(failure) => self.record_failure_reason(&failure.reason),
+        }
+    }
+
+    pub fn record_total_fragment(&mut self) {
+        self.total_fragments += 1;
+    }
+
+    pub fn record_passed_fragment(&mut self) {
+        self.passed_fragments += 1;
+    }
+
+    pub fn record_failure_reason(&mut self, reason: &QcFilterReason) {
+        match reason {
+            QcFilterReason::PairIncomplete { .. } => self.pair_incomplete += 1,
+            QcFilterReason::LengthOutOfBounds { .. } => self.length_filtered += 1,
+            QcFilterReason::NContent { .. } => self.n_content_filtered += 1,
+            QcFilterReason::LowComplexity { .. } => self.low_complexity_filtered += 1,
         }
     }
 }
@@ -188,8 +224,17 @@ impl QcFilter {
     }
 
     pub fn filter(&self, fragment: &FragmentRecord<'_>) -> QcResult {
+        match self.filter_cheap(fragment) {
+            CheapQcResult::Pass(cheap_pass) => {
+                self.complete_entropy_validation(fragment, cheap_pass)
+            }
+            CheapQcResult::Filtered(failure) => QcResult::Filtered(failure),
+        }
+    }
+
+    pub fn filter_cheap(&self, fragment: &FragmentRecord<'_>) -> CheapQcResult {
         if self.config.require_pair && fragment.read1.is_empty() {
-            return QcResult::Filtered(QcFailure {
+            return CheapQcResult::Filtered(QcFailure {
                 reason: QcFilterReason::PairIncomplete {
                     missing_or_empty: Mate::Read1,
                 },
@@ -197,19 +242,19 @@ impl QcFilter {
         }
 
         if let Some(reason) = self.length_failure(Mate::Read1, fragment.read1) {
-            return QcResult::Filtered(QcFailure { reason });
+            return CheapQcResult::Filtered(QcFailure { reason });
         }
 
         let read2 = match fragment.read2 {
             Some(read2) if self.config.require_pair && read2.is_empty() => {
-                return QcResult::Filtered(QcFailure {
+                return CheapQcResult::Filtered(QcFailure {
                     reason: QcFilterReason::PairIncomplete {
                         missing_or_empty: Mate::Read2,
                     },
                 });
             }
             None if self.config.require_pair => {
-                return QcResult::Filtered(QcFailure {
+                return CheapQcResult::Filtered(QcFailure {
                     reason: QcFilterReason::PairIncomplete {
                         missing_or_empty: Mate::Read2,
                     },
@@ -220,13 +265,13 @@ impl QcFilter {
 
         if let Some(read2) = read2 {
             if let Some(reason) = self.length_failure(Mate::Read2, read2) {
-                return QcResult::Filtered(QcFailure { reason });
+                return CheapQcResult::Filtered(QcFailure { reason });
             }
         }
 
         let n_fraction = fragment_n_fraction(fragment.read1, read2);
         if n_fraction > self.config.max_n_fraction {
-            return QcResult::Filtered(QcFailure {
+            return CheapQcResult::Filtered(QcFailure {
                 reason: QcFilterReason::NContent {
                     observed_fraction: n_fraction,
                     max_fraction: self.config.max_n_fraction,
@@ -234,6 +279,24 @@ impl QcFilter {
             });
         }
 
+        if let Some(reason) = self.fast_low_complexity_failure(Mate::Read1, fragment.read1) {
+            return CheapQcResult::Filtered(QcFailure { reason });
+        }
+
+        if let Some(read2) = read2 {
+            if let Some(reason) = self.fast_low_complexity_failure(Mate::Read2, read2) {
+                return CheapQcResult::Filtered(QcFailure { reason });
+            }
+        }
+
+        CheapQcResult::Pass(CheapQcPass { n_fraction })
+    }
+
+    pub fn complete_entropy_validation(
+        &self,
+        fragment: &FragmentRecord<'_>,
+        cheap_pass: CheapQcPass,
+    ) -> QcResult {
         let read1_entropy_bits = shannon_entropy_2mer(fragment.read1);
         if read1_entropy_bits < self.config.low_complexity_entropy_bits {
             return QcResult::Filtered(QcFailure {
@@ -245,7 +308,7 @@ impl QcFilter {
             });
         }
 
-        let read2_entropy_bits = read2.map(shannon_entropy_2mer);
+        let read2_entropy_bits = fragment.read2.map(shannon_entropy_2mer);
         if let Some(read2_entropy_bits) = read2_entropy_bits {
             if read2_entropy_bits < self.config.low_complexity_entropy_bits {
                 return QcResult::Filtered(QcFailure {
@@ -259,7 +322,7 @@ impl QcFilter {
         }
 
         QcResult::Pass(QcPass {
-            n_fraction,
+            n_fraction: cheap_pass.n_fraction,
             read1_entropy_bits,
             read2_entropy_bits,
         })
@@ -288,6 +351,19 @@ impl QcFilter {
 
         None
     }
+
+    fn fast_low_complexity_failure(&self, mate: Mate, read: &[u8]) -> Option<QcFilterReason> {
+        let observed_entropy_bits = fast_low_complexity_entropy_bits(read)?;
+        if observed_entropy_bits < self.config.low_complexity_entropy_bits {
+            return Some(QcFilterReason::LowComplexity {
+                mate,
+                observed_entropy_bits,
+                min_entropy_bits: self.config.low_complexity_entropy_bits,
+            });
+        }
+
+        None
+    }
 }
 
 fn fragment_n_fraction(read1: &[u8], read2: Option<&[u8]>) -> f64 {
@@ -301,6 +377,63 @@ fn count_ns(read: &[u8]) -> usize {
     read.iter()
         .filter(|base| matches!(base.to_ascii_uppercase(), b'N'))
         .count()
+}
+
+fn fast_low_complexity_entropy_bits(read: &[u8]) -> Option<f64> {
+    if read.is_empty() {
+        return None;
+    }
+
+    let mut canonical = read.iter().copied().map(canonical_base);
+    let first = canonical.next()??;
+
+    if canonical.clone().all(|base| base == Some(first)) {
+        return Some(0.0);
+    }
+
+    let second = canonical_base(*read.get(1)?)?;
+    if first == second {
+        return None;
+    }
+
+    for (index, base) in read.iter().copied().enumerate() {
+        let expected = if index % 2 == 0 { first } else { second };
+        if canonical_base(base)? != expected {
+            return None;
+        }
+    }
+
+    let total_2mers = read.len().saturating_sub(1);
+    if total_2mers == 0 {
+        return Some(0.0);
+    }
+
+    let first_count = total_2mers.div_ceil(2);
+    let second_count = total_2mers / 2;
+    Some(binary_shannon_entropy_bits(first_count, second_count))
+}
+
+fn canonical_base(base: u8) -> Option<u8> {
+    match base.to_ascii_uppercase() {
+        b'A' | b'C' | b'G' | b'T' => Some(base.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+fn binary_shannon_entropy_bits(left: usize, right: usize) -> f64 {
+    let total = left + right;
+    if total == 0 {
+        return 0.0;
+    }
+
+    [left, right]
+        .into_iter()
+        .filter(|count| *count > 0)
+        .map(|count| {
+            let probability = count as f64 / total as f64;
+            -probability * probability.log2()
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -376,6 +509,106 @@ mod tests {
             }
             other => panic!("expected low-complexity failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cheap_qc_rejects_homopolymer_reads_conservatively() {
+        let filter = QcFilter::default();
+        let read1 = "A".repeat(150);
+        let read2 = diverse_sequence(150, 67);
+
+        let result =
+            filter.filter_cheap(&FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()));
+
+        assert!(matches!(
+            result.reason(),
+            Some(QcFilterReason::LowComplexity {
+                mate: Mate::Read1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cheap_qc_rejects_dinucleotide_repeats_conservatively() {
+        let filter = QcFilter::default();
+        let read1 = "AT".repeat(75);
+        let read2 = diverse_sequence(150, 71);
+
+        let result =
+            filter.filter_cheap(&FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()));
+
+        assert!(matches!(
+            result.reason(),
+            Some(QcFilterReason::LowComplexity {
+                mate: Mate::Read1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cheap_qc_preserves_high_n_filtering() {
+        let filter = QcFilter::default();
+        let read1 = "N".repeat(150);
+        let read2 = diverse_sequence(150, 73);
+
+        let result =
+            filter.filter_cheap(&FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()));
+
+        assert_eq!(
+            result.reason(),
+            Some(&QcFilterReason::NContent {
+                observed_fraction: 0.5,
+                max_fraction: 0.10,
+            })
+        );
+    }
+
+    #[test]
+    fn cheap_qc_preserves_short_read_filtering() {
+        let filter = QcFilter::default();
+        let read1 = diverse_sequence(50, 79);
+        let read2 = diverse_sequence(150, 83);
+
+        let result =
+            filter.filter_cheap(&FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()));
+
+        assert_eq!(
+            result.reason(),
+            Some(&QcFilterReason::LengthOutOfBounds {
+                mate: Mate::Read1,
+                observed: 50,
+                min: 100,
+                max: 250,
+            })
+        );
+    }
+
+    #[test]
+    fn retained_samples_still_receive_full_entropy_validation() {
+        let filter = QcFilter::default();
+        let read1 = format!("{}C", "A".repeat(149));
+        let read2 = diverse_sequence(150, 89);
+
+        let cheap_pass = match filter
+            .filter_cheap(&FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()))
+        {
+            CheapQcResult::Pass(pass) => pass,
+            other => panic!("expected cheap QC to pass near-homopolymer, got {other:?}"),
+        };
+        let result = filter.complete_entropy_validation(
+            &FragmentRecord::paired(read1.as_bytes(), read2.as_bytes()),
+            cheap_pass,
+        );
+
+        assert!(matches!(
+            result.reason(),
+            Some(QcFilterReason::LowComplexity {
+                mate: Mate::Read1,
+                ..
+            })
+        ));
     }
 
     #[test]

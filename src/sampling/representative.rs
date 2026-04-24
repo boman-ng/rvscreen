@@ -1,6 +1,7 @@
 use crate::error::{Result, RvScreenError};
-use crate::sampling::Sampler;
 use siphasher::sip::SipHasher13;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::hash::Hasher;
 
 pub const DEFAULT_REPRESENTATIVE_ROUNDS: [u64; 5] = [50_000, 100_000, 200_000, 400_000, 800_000];
@@ -9,19 +10,46 @@ pub const DEFAULT_REPRESENTATIVE_ROUNDS: [u64; 5] = [50_000, 100_000, 200_000, 4
 pub struct RepresentativeSampler {
     seed: u64,
     rounds: Vec<u64>,
-    bucket_universe: u64,
+    max_fragments: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RepresentativeRank {
+    hash: u64,
+    fragment_key: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct RankedRepresentative<T> {
+    rank: RepresentativeRank,
+    payload: T,
+}
+
+#[derive(Debug)]
+pub(crate) struct RepresentativeRetention<T> {
+    max_fragments: usize,
+    retained: BinaryHeap<RankedRepresentative<T>>,
 }
 
 impl RepresentativeSampler {
     pub fn new(seed: u64, rounds: Vec<u64>) -> Result<Self> {
         validate_rounds(&rounds)?;
+        let max_fragments = usize::try_from(
+            *rounds
+                .last()
+                .expect("validated representative rounds must be non-empty"),
+        )
+        .map_err(|_| {
+            RvScreenError::validation(
+                "sampling.rounds",
+                "representative sampling final round exceeds platform usize capacity",
+            )
+        })?;
 
         Ok(Self {
             seed,
-            bucket_universe: *rounds
-                .last()
-                .expect("validated representative rounds must be non-empty"),
             rounds,
+            max_fragments,
         })
     }
 
@@ -46,28 +74,26 @@ impl RepresentativeSampler {
         self.rounds.get(round).copied()
     }
 
-    pub fn bucket_universe(&self) -> u64 {
-        self.bucket_universe
+    pub fn max_fragments(&self) -> usize {
+        self.max_fragments
     }
 
-    pub fn bucket_for(&self, fragment_key: &str) -> u64 {
-        self.hash_fragment_key(fragment_key) % self.bucket_universe
+    pub(crate) fn rank_fragment(&self, fragment_key: &str) -> RepresentativeRank {
+        RepresentativeRank {
+            hash: self.hash_fragment_key(fragment_key),
+            fragment_key: fragment_key.to_string(),
+        }
     }
 
-    pub fn entry_round_for(&self, fragment_key: &str) -> Option<usize> {
-        self.entry_round_for_bucket(self.bucket_for(fragment_key))
+    pub(crate) fn prefix_sample_sizes(&self, retained_sample_len: usize) -> Vec<u64> {
+        let retained_sample_len = u64::try_from(retained_sample_len).unwrap_or(u64::MAX);
+        self.rounds
+            .iter()
+            .map(|target| (*target).min(retained_sample_len))
+            .collect()
     }
 
-    pub fn entry_round_for_bucket(&self, bucket: u64) -> Option<usize> {
-        self.rounds.iter().position(|target| bucket < *target)
-    }
-
-    pub fn should_accept(&self, fragment_key: &str, round: usize) -> bool {
-        self.round_target(round)
-            .is_some_and(|target| self.bucket_for(fragment_key) < target)
-    }
-
-    fn hash_fragment_key(&self, fragment_key: &str) -> u64 {
+    pub(crate) fn hash_fragment_key(&self, fragment_key: &str) -> u64 {
         let mut hasher = SipHasher13::new_with_keys(0, 0);
         hasher.write_u64(self.seed);
         hasher.write(fragment_key.as_bytes());
@@ -75,10 +101,85 @@ impl RepresentativeSampler {
     }
 }
 
-impl Sampler for RepresentativeSampler {
-    fn should_accept(&self, fragment_key: &str, _index: usize) -> bool {
-        let last_round = self.round_count().saturating_sub(1);
-        RepresentativeSampler::should_accept(self, fragment_key, last_round)
+impl<T> RankedRepresentative<T> {
+    pub(crate) fn new(rank: RepresentativeRank, payload: T) -> Self {
+        Self { rank, payload }
+    }
+
+    pub(crate) fn rank(&self) -> &RepresentativeRank {
+        &self.rank
+    }
+
+    pub(crate) fn into_payload(self) -> T {
+        self.payload
+    }
+}
+
+impl<T> PartialEq for RankedRepresentative<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank == other.rank
+    }
+}
+
+impl<T> Eq for RankedRepresentative<T> {}
+
+impl<T> PartialOrd for RankedRepresentative<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for RankedRepresentative<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank.cmp(&other.rank)
+    }
+}
+
+impl<T> RepresentativeRetention<T> {
+    pub(crate) fn new(max_fragments: usize) -> Self {
+        Self {
+            max_fragments,
+            retained: BinaryHeap::with_capacity(max_fragments),
+        }
+    }
+
+    pub(crate) fn would_retain_hash(&self, candidate_hash: u64, fragment_key: &str) -> bool {
+        if self.max_fragments == 0 {
+            return false;
+        }
+
+        self.retained.len() < self.max_fragments
+            || self.retained.peek().is_some_and(|worst_retained| {
+                candidate_hash < worst_retained.rank.hash
+                    || (candidate_hash == worst_retained.rank.hash
+                        && fragment_key < worst_retained.rank.fragment_key.as_str())
+            })
+    }
+
+    pub(crate) fn consider(&mut self, candidate: RankedRepresentative<T>) {
+        if self.max_fragments == 0 {
+            return;
+        }
+
+        if self.retained.len() < self.max_fragments {
+            self.retained.push(candidate);
+            return;
+        }
+
+        let should_replace = self
+            .retained
+            .peek()
+            .is_some_and(|worst_retained| candidate.rank() < worst_retained.rank());
+        if should_replace {
+            self.retained.pop();
+            self.retained.push(candidate);
+        }
+    }
+
+    pub(crate) fn into_sorted_vec(self) -> Vec<RankedRepresentative<T>> {
+        let mut retained = self.retained.into_vec();
+        retained.sort_by(|left, right| left.rank.cmp(&right.rank));
+        retained
     }
 }
 
@@ -189,7 +290,10 @@ fn validate_rounds(rounds: &[u64]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepresentativeSampler, RoundManager, DEFAULT_REPRESENTATIVE_ROUNDS};
+    use super::{
+        RankedRepresentative, RepresentativeRetention, RepresentativeSampler, RoundManager,
+        DEFAULT_REPRESENTATIVE_ROUNDS,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -197,17 +301,17 @@ mod tests {
         let sampler = RepresentativeSampler::with_default_rounds(42);
         let repeated = RepresentativeSampler::with_default_rounds(42);
 
-        let first_pass: Vec<bool> = (0..1_000)
+        let first_pass: Vec<_> = (0..1_000)
             .map(fragment_key)
-            .map(|key| sampler.should_accept(&key, 0))
+            .map(|key| sampler.rank_fragment(&key))
             .collect();
-        let second_pass: Vec<bool> = (0..1_000)
+        let second_pass: Vec<_> = (0..1_000)
             .map(fragment_key)
-            .map(|key| sampler.should_accept(&key, 0))
+            .map(|key| sampler.rank_fragment(&key))
             .collect();
-        let recreated_pass: Vec<bool> = (0..1_000)
+        let recreated_pass: Vec<_> = (0..1_000)
             .map(fragment_key)
-            .map(|key| repeated.should_accept(&key, 0))
+            .map(|key| repeated.rank_fragment(&key))
             .collect();
 
         assert_eq!(first_pass, second_pass);
@@ -217,12 +321,15 @@ mod tests {
     #[test]
     fn test_representative_sampling_rounds_are_strictly_nested() {
         let sampler = RepresentativeSampler::with_default_rounds(42);
-        let keys: Vec<String> = (0..20_000).map(fragment_key).collect();
+        let retained_keys = retained_keys_for(&sampler, (0..1_000_000).map(fragment_key).collect());
+        let prefix_sizes = sampler.prefix_sample_sizes(retained_keys.len());
 
-        let accepted_by_round: Vec<BTreeSet<String>> = (0..sampler.round_count())
-            .map(|round| {
-                keys.iter()
-                    .filter(|key| sampler.should_accept(key, round))
+        let accepted_by_round: Vec<BTreeSet<String>> = prefix_sizes
+            .iter()
+            .map(|target| {
+                retained_keys
+                    .iter()
+                    .take(*target as usize)
                     .cloned()
                     .collect()
             })
@@ -232,17 +339,20 @@ mod tests {
             assert!(pair[0].is_subset(&pair[1]));
         }
 
-        for round in 1..sampler.round_count() {
-            let witness = (0..200_000).map(fragment_key).find(|key| {
-                sampler.should_accept(key, round) && !sampler.should_accept(key, round - 1)
-            });
+        assert_eq!(prefix_sizes, sampler.rounds());
+    }
 
-            assert!(
-                witness.is_some(),
-                "expected round {round} to strictly expand round {}",
-                round - 1
-            );
-        }
+    #[test]
+    fn test_representative_exact_k_sampling_caps_final_round_at_kmax() {
+        let sampler = RepresentativeSampler::new(42, vec![3, 5, 8])
+            .expect("representative rounds should be valid");
+        let retained_keys = retained_keys_for(&sampler, (0..128).map(fragment_key).collect());
+        let prefix_sizes = sampler.prefix_sample_sizes(retained_keys.len());
+        let expected = expected_top_k_keys(&sampler, 128);
+
+        assert_eq!(retained_keys, expected);
+        assert_eq!(retained_keys.len(), 8);
+        assert_eq!(prefix_sizes, vec![3, 5, 8]);
     }
 
     #[test]
@@ -250,39 +360,22 @@ mod tests {
         let sampler = RepresentativeSampler::with_default_rounds(42);
         let keys: Vec<String> = (0..1_000).map(fragment_key).collect();
 
-        let forward: BTreeSet<String> = keys
-            .iter()
-            .filter(|key| sampler.should_accept(key, 2))
-            .cloned()
-            .collect();
-        let reverse: BTreeSet<String> = keys
-            .iter()
-            .rev()
-            .filter(|key| sampler.should_accept(key, 2))
-            .cloned()
-            .collect();
-
+        let forward = retained_keys_for(&sampler, keys.clone());
+        let reverse = retained_keys_for(&sampler, keys.into_iter().rev().collect());
         assert_eq!(forward, reverse);
     }
 
     #[test]
-    fn test_entry_round_tracks_first_round_that_accepts_each_fragment() {
-        let sampler = RepresentativeSampler::new(42, vec![10, 20, 40])
+    fn test_representative_exact_k_small_input_saturates_all_round_prefixes() {
+        let sampler = RepresentativeSampler::new(42, vec![50, 100])
             .expect("representative rounds should be valid");
+        let retained_keys = retained_keys_for(&sampler, (0..12).map(fragment_key).collect());
 
-        for key in (0..5_000).map(fragment_key) {
-            let accepted_rounds: Vec<usize> = (0..sampler.round_count())
-                .filter(|&round| sampler.should_accept(&key, round))
-                .collect();
-
-            match sampler.entry_round_for(&key) {
-                Some(entry_round) => {
-                    let expected_rounds = (entry_round..sampler.round_count()).collect::<Vec<_>>();
-                    assert_eq!(accepted_rounds, expected_rounds);
-                }
-                None => assert!(accepted_rounds.is_empty()),
-            }
-        }
+        assert_eq!(retained_keys.len(), 12);
+        assert_eq!(
+            sampler.prefix_sample_sizes(retained_keys.len()),
+            vec![12, 12]
+        );
     }
 
     #[test]
@@ -328,5 +421,31 @@ mod tests {
 
     fn fragment_key(index: usize) -> String {
         format!("fragment-{index:06}")
+    }
+
+    fn retained_keys_for(sampler: &RepresentativeSampler, keys: Vec<String>) -> Vec<String> {
+        let mut retention = RepresentativeRetention::new(sampler.max_fragments());
+        for key in keys {
+            retention.consider(RankedRepresentative::new(sampler.rank_fragment(&key), key));
+        }
+
+        retention
+            .into_sorted_vec()
+            .into_iter()
+            .map(RankedRepresentative::into_payload)
+            .collect()
+    }
+
+    fn expected_top_k_keys(sampler: &RepresentativeSampler, total_keys: usize) -> Vec<String> {
+        let mut ranked = (0..total_keys)
+            .map(fragment_key)
+            .map(|key| RankedRepresentative::new(sampler.rank_fragment(&key), key))
+            .collect::<Vec<_>>();
+        ranked.sort();
+        ranked
+            .into_iter()
+            .take(sampler.max_fragments())
+            .map(RankedRepresentative::into_payload)
+            .collect()
     }
 }
