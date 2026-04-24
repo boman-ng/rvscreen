@@ -2,11 +2,44 @@ pub use super::FragmentRecord;
 use crate::error::{Result, RvScreenError};
 use flate2::read::MultiGzDecoder;
 use seq_io::fastq::{Error as FastqError, Reader, Record};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const FASTQ_RECORD_LINES: u64 = 4;
+
+#[derive(Debug, Clone)]
+pub(crate) struct BorrowedFragmentRecord<'a> {
+    pub fragment_key: Cow<'a, str>,
+    pub r1_seq: &'a [u8],
+    pub r1_qual: &'a [u8],
+    pub r2_seq: &'a [u8],
+    pub r2_qual: &'a [u8],
+}
+
+impl<'a> BorrowedFragmentRecord<'a> {
+    pub(crate) fn into_owned_with_qualities(self) -> Result<FragmentRecord> {
+        Ok(FragmentRecord::new(
+            self.fragment_key.into_owned(),
+            self.r1_seq.to_vec(),
+            decode_fastq_quality_scores(self.r1_qual)?,
+            self.r2_seq.to_vec(),
+            decode_fastq_quality_scores(self.r2_qual)?,
+        ))
+    }
+
+    pub(crate) fn into_owned_without_qualities(self) -> FragmentRecord {
+        FragmentRecord::new(
+            self.fragment_key.into_owned(),
+            self.r1_seq.to_vec(),
+            Vec::new(),
+            self.r2_seq.to_vec(),
+            Vec::new(),
+        )
+    }
+}
 
 pub struct FastqPairReader {
     r1_path: PathBuf,
@@ -35,6 +68,33 @@ impl FastqPairReader {
     }
 
     pub fn next_pair(&mut self) -> Option<Result<FragmentRecord>> {
+        self.map_next_pair(|fragment| fragment.into_owned_with_qualities())
+    }
+
+    pub(crate) fn for_each_borrowed_pair_with_timing<F>(&mut self, mut visit: F) -> Result<Duration>
+    where
+        F: for<'a> FnMut(BorrowedFragmentRecord<'a>) -> Result<()>,
+    {
+        let mut io_wall_duration = Duration::default();
+
+        loop {
+            let started = std::time::Instant::now();
+            let item = self.map_next_pair(|fragment| visit(fragment));
+            io_wall_duration = io_wall_duration.saturating_add(started.elapsed());
+
+            match item {
+                Some(result) => result?,
+                None => break,
+            }
+        }
+
+        Ok(io_wall_duration)
+    }
+
+    fn map_next_pair<T, F>(&mut self, on_pair: F) -> Option<Result<T>>
+    where
+        F: for<'a> FnOnce(BorrowedFragmentRecord<'a>) -> Result<T>,
+    {
         let line = fastq_record_line(self.pair_index);
         let r1_path = self.r1_path.clone();
         let r2_path = self.r2_path.clone();
@@ -45,9 +105,10 @@ impl FastqPairReader {
             (None, None) => None,
             (Some(Err(err)), _) => Some(Err(map_fastq_error(&r1_path, err))),
             (_, Some(Err(err))) => Some(Err(map_fastq_error(&r2_path, err))),
-            (Some(Ok(r1)), Some(Ok(r2))) => {
-                Some(build_fragment_record(&r1_path, &r2_path, line, &r1, &r2))
-            }
+            (Some(Ok(r1)), Some(Ok(r2))) => Some(
+                build_borrowed_fragment_record(&r1_path, &r2_path, line, &r1, &r2)
+                    .and_then(on_pair),
+            ),
             (Some(Ok(r1)), None) => Some(Err(orphan_error(
                 &r1_path,
                 &r2_path,
@@ -79,26 +140,20 @@ impl Iterator for FastqPairReader {
 }
 
 pub fn normalize_qname(qname: &str) -> String {
-    let id = qname.split_ascii_whitespace().next().unwrap_or(qname);
-    let id = id
-        .strip_suffix("/1")
-        .or_else(|| id.strip_suffix("/2"))
-        .unwrap_or(id);
-
-    id.to_owned()
+    normalize_qname_view(qname).to_owned()
 }
 
-fn build_fragment_record(
+fn build_borrowed_fragment_record<'a>(
     r1_path: &Path,
     r2_path: &Path,
     line: u64,
-    r1: &impl Record,
-    r2: &impl Record,
-) -> Result<FragmentRecord> {
+    r1: &'a impl Record,
+    r2: &'a impl Record,
+) -> Result<BorrowedFragmentRecord<'a>> {
     let r1_header = header_text(r1);
     let r2_header = header_text(r2);
-    let r1_key = normalize_qname(&r1_header);
-    let r2_key = normalize_qname(&r2_header);
+    let r1_key = normalize_record_key(r1.head());
+    let r2_key = normalize_record_key(r2.head());
 
     if r1_key != r2_key {
         return Err(RvScreenError::parse(
@@ -116,13 +171,13 @@ fn build_fragment_record(
         ));
     }
 
-    Ok(FragmentRecord::new(
-        r1_key,
-        r1.seq().to_vec(),
-        decode_fastq_quality_scores(r1.qual())?,
-        r2.seq().to_vec(),
-        decode_fastq_quality_scores(r2.qual())?,
-    ))
+    Ok(BorrowedFragmentRecord {
+        fragment_key: r1_key,
+        r1_seq: r1.seq(),
+        r1_qual: r1.qual(),
+        r2_seq: r2.seq(),
+        r2_qual: r2.qual(),
+    })
 }
 
 fn orphan_error(
@@ -157,8 +212,22 @@ fn is_gzip_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "gz")
 }
 
-fn header_text(record: &impl Record) -> String {
-    String::from_utf8_lossy(record.head()).into_owned()
+fn normalize_qname_view(qname: &str) -> &str {
+    let id = qname.split_ascii_whitespace().next().unwrap_or(qname);
+    id.strip_suffix("/1")
+        .or_else(|| id.strip_suffix("/2"))
+        .unwrap_or(id)
+}
+
+fn normalize_record_key(head: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(head) {
+        Ok(header) => Cow::Borrowed(normalize_qname_view(header)),
+        Err(_) => Cow::Owned(normalize_qname(String::from_utf8_lossy(head).as_ref())),
+    }
+}
+
+fn header_text(record: &impl Record) -> Cow<'_, str> {
+    String::from_utf8_lossy(record.head())
 }
 
 fn decode_fastq_quality_scores(qualities: &[u8]) -> Result<Vec<u8>> {
@@ -415,6 +484,42 @@ mod tests {
 
         assert_eq!(record.r1_qual, vec![30, 31, 32, 33]);
         assert_eq!(record.r2_qual, vec![33, 34, 35, 36]);
+    }
+
+    #[test]
+    fn test_borrowed_pair_iteration_skips_quality_decode_until_requested() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let r1_path = tempdir.path().join("r1.fastq");
+        let r2_path = tempdir.path().join("r2.fastq");
+
+        fs::write(&r1_path, b"@read/1\nACGT\n+\n\x1f\x1f\x1f\x1f\n")
+            .expect("R1 FASTQ should be written");
+        fs::write(&r2_path, b"@read/2\nTGCA\n+\n\x1f\x1f\x1f\x1f\n")
+            .expect("R2 FASTQ should be written");
+
+        let mut borrowed_reader = FastqPairReader::open(&r1_path, &r2_path)
+            .expect("reader should open for borrowed iteration");
+        let mut visited = 0usize;
+        let io_wall_duration = borrowed_reader
+            .for_each_borrowed_pair_with_timing(|fragment| {
+                assert_eq!(fragment.fragment_key.as_ref(), "read");
+                assert_eq!(fragment.r1_seq, b"ACGT");
+                assert_eq!(fragment.r2_seq, b"TGCA");
+                visited += 1;
+                Ok(())
+            })
+            .expect("borrowed iteration should not decode FASTQ qualities");
+        assert_eq!(visited, 1);
+        assert!(io_wall_duration > Duration::default());
+
+        let err = FastqPairReader::open(&r1_path, &r2_path)
+            .expect("reader should reopen")
+            .next_pair()
+            .expect("pair should exist")
+            .expect_err("owned pair construction should still decode qualities");
+        assert!(err
+            .to_string()
+            .contains("FASTQ quality byte 31 is below Phred+33 encoding range"));
     }
 
     fn read_all_pairs(r1_path: &Path, r2_path: &Path) -> Result<Vec<FragmentRecord>> {

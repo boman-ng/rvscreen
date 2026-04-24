@@ -1,3 +1,4 @@
+use super::fastq::FastqPairReader;
 use crate::error::{Result, RvScreenError};
 use noodles::sam;
 use std::path::Path;
@@ -42,6 +43,10 @@ pub type FragmentStream = Box<dyn Iterator<Item = Result<FragmentRecord>>>;
 /// Factory trait for opening unified fragment readers.
 pub trait FragmentReaderFactory {
     fn open_reader(&self) -> Result<FragmentStream>;
+
+    fn open_fastq_pair_reader(&self) -> Option<Result<FastqPairReader>> {
+        None
+    }
 
     fn kind_label(&self) -> &'static str;
 }
@@ -173,13 +178,9 @@ mod tests {
             Some(MateSlot::Read1),
         );
 
-        let fragment = build_name_sorted_fragment_record(
-            Path::new("sample.bam"),
-            "BAM",
-            &first,
-            &second,
-        )
-        .expect("flagged mates should build one fragment");
+        let fragment =
+            build_name_sorted_fragment_record(Path::new("sample.bam"), "BAM", &first, &second)
+                .expect("flagged mates should build one fragment");
 
         assert_eq!(fragment.fragment_key, "read");
         assert_eq!(fragment.r1_seq, b"ACGT");
@@ -205,13 +206,9 @@ mod tests {
             None,
         );
 
-        let fragment = build_name_sorted_fragment_record(
-            Path::new("sample.cram"),
-            "CRAM",
-            &first,
-            &second,
-        )
-        .expect("unflagged mates should still build one fragment");
+        let fragment =
+            build_name_sorted_fragment_record(Path::new("sample.cram"), "CRAM", &first, &second)
+                .expect("unflagged mates should still build one fragment");
 
         assert_eq!(fragment.r1_seq, b"AAAA");
         assert_eq!(fragment.r2_seq, b"CCCC");
