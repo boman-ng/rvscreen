@@ -1,6 +1,8 @@
 use crate::calibration::{load_profile, load_reference_bundle};
 use crate::cli::AuditVerifyArgs;
-use crate::decision::{expected_release_status, NegativeControlDecisionInput, NegativeControlResult};
+use crate::decision::{
+    expected_release_status, NegativeControlDecisionInput, NegativeControlResult,
+};
 use crate::error::{Result, RvScreenError};
 use crate::report::contract::{
     sampling_only_ci_label_violation, CANDIDATE_CALLS_TSV, CHECKSUM_SHA256,
@@ -826,7 +828,10 @@ fn negative_control_from_manifest(
         NegativeControlStatus::Missing => NegativeControlDecisionInput::Missing,
         NegativeControlStatus::Pass => NegativeControlDecisionInput::Passed {
             comparator: crate::decision::BackgroundComparator::new(&NegativeControlResult {
-                control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                control_id: manifest
+                    .control_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 control_status: manifest
                     .control_status
                     .clone()
@@ -834,7 +839,10 @@ fn negative_control_from_manifest(
                 candidates: Vec::new(),
             }),
             result: NegativeControlResult {
-                control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                control_id: manifest
+                    .control_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 control_status: manifest
                     .control_status
                     .clone()
@@ -842,14 +850,19 @@ fn negative_control_from_manifest(
                 candidates: Vec::new(),
             },
         },
-        NegativeControlStatus::Fail => NegativeControlDecisionInput::Failed(NegativeControlResult {
-            control_id: manifest.control_id.clone().unwrap_or_else(|| "unknown".to_string()),
-            control_status: manifest
-                .control_status
-                .clone()
-                .unwrap_or_else(|| "fail".to_string()),
-            candidates: Vec::new(),
-        }),
+        NegativeControlStatus::Fail => {
+            NegativeControlDecisionInput::Failed(NegativeControlResult {
+                control_id: manifest
+                    .control_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                control_status: manifest
+                    .control_status
+                    .clone()
+                    .unwrap_or_else(|| "fail".to_string()),
+                candidates: Vec::new(),
+            })
+        }
     }
 }
 
@@ -892,8 +905,8 @@ fn sha256_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::decision::SAMPLING_ONLY_CI_LABEL;
-    use crate::report::ReportWriter;
     use crate::report::contract::FRACTION_CI_REASON_PREFIX;
+    use crate::report::ReportWriter;
     use crate::types::{
         CandidateCall, DecisionStatus, EvidenceStrength, NegativeControlManifest,
         NegativeControlStatus, ProfileToml, SamplingConfig, StopReason,
@@ -980,9 +993,10 @@ mod tests {
         let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
 
         let mut candidate_rows = candidate_fixtures();
-        candidate_rows[0]
-            .decision_reasons
-            .push(format!("fraction_ci_95_label={}", crate::decision::SAMPLING_ONLY_CI_LABEL));
+        candidate_rows[0].decision_reasons.push(format!(
+            "fraction_ci_95_label={}",
+            crate::decision::SAMPLING_ONLY_CI_LABEL
+        ));
         ReportWriter::write(
             &fixture.report_dir,
             &sample_summary_fixture("rvscreen_ref_2026.04.21-r1"),
@@ -997,7 +1011,12 @@ mod tests {
     fn streaming_final_release_status_fails_audit() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
-        write_profile_dir_with_mode_and_negative_control(&fixture.profile_dir, "rvscreen_ref_2026.04.21-r1", "streaming", false);
+        write_profile_dir_with_mode_and_negative_control(
+            &fixture.profile_dir,
+            "rvscreen_ref_2026.04.21-r1",
+            "streaming",
+            false,
+        );
         write_run_manifest_with_negative_control(&fixture.report_dir, |manifest| {
             manifest.sampling_mode = "streaming".to_string();
         });
@@ -1025,7 +1044,12 @@ mod tests {
     fn representative_required_negative_control_cannot_be_provisional() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
-        write_profile_dir_with_mode_and_negative_control(&fixture.profile_dir, "rvscreen_ref_2026.04.21-r1", "representative", true);
+        write_profile_dir_with_mode_and_negative_control(
+            &fixture.profile_dir,
+            "rvscreen_ref_2026.04.21-r1",
+            "representative",
+            true,
+        );
         write_run_manifest_with_negative_control(&fixture.report_dir, |manifest| {
             manifest.negative_control.required = true;
         });
@@ -1278,7 +1302,7 @@ mod tests {
             &round_fixtures(),
             &manifest,
         )
-            .expect("report bundle should be rewritten with refreshed checksum");
+        .expect("report bundle should be rewritten with refreshed checksum");
     }
 
     fn sample_summary_fixture(reference_version: &str) -> SampleSummary {
@@ -1290,7 +1314,7 @@ mod tests {
             seed: 20_260_421,
             input_fragments: 100_000,
             qc_passing_fragments: 95_000,
-            sampled_fragments: 50_000,
+            sampled_fragments: 100_000,
             rounds_run: 2,
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
@@ -1341,7 +1365,7 @@ mod tests {
             accepted_fragments: 12,
             nonoverlap_fragments: 4,
             raw_fraction: 0.00012,
-            unique_fraction: 0.00013,
+            unique_fraction: 12.0 / 100_000.0,
             fraction_ci_95: [0.00008, 0.00018],
             clopper_pearson_upper: 0.0002,
             breadth: 0.01,

@@ -8,11 +8,11 @@ use crate::types::{CandidateCall, DecisionStatus, RoundRecord, RunManifest, Samp
 use csv::WriterBuilder;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -115,10 +115,7 @@ fn validate_bundle_inputs(
         if let Some(violation) = sampling_only_ci_label_violation(&candidate.decision_reasons) {
             return Err(RvScreenError::validation(
                 "report.candidate_calls.fraction_ci_95",
-                format!(
-                    "candidate `{}` {violation}",
-                    candidate.accession_or_group,
-                ),
+                format!("candidate `{}` {violation}", candidate.accession_or_group,),
             ));
         }
     }
@@ -347,8 +344,13 @@ fn collect_report_bundle_files_recursive(
     Ok(())
 }
 
-fn write_checksum_file(checksum_path: &Path, bundle_dir: &Path, files: &[std::path::PathBuf]) -> Result<()> {
-    let file = File::create(checksum_path).map_err(|error| RvScreenError::io(checksum_path, error))?;
+fn write_checksum_file(
+    checksum_path: &Path,
+    bundle_dir: &Path,
+    files: &[std::path::PathBuf],
+) -> Result<()> {
+    let file =
+        File::create(checksum_path).map_err(|error| RvScreenError::io(checksum_path, error))?;
     let mut writer = BufWriter::new(file);
 
     for path in files {
@@ -367,7 +369,9 @@ fn write_checksum_file(checksum_path: &Path, bundle_dir: &Path, files: &[std::pa
             .map_err(|error| RvScreenError::io(checksum_path, error))?;
     }
 
-    writer.flush().map_err(|error| RvScreenError::io(checksum_path, error))
+    writer
+        .flush()
+        .map_err(|error| RvScreenError::io(checksum_path, error))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -543,6 +547,25 @@ mod tests {
         .expect("fraction_ci_95 should stay JSON encoded");
         assert_eq!(fraction_ci_95, candidates[0].fraction_ci_95);
 
+        let accepted_fragments = positive_record
+            .get(3)
+            .expect("accepted_fragments column should exist")
+            .parse::<u64>()
+            .expect("accepted_fragments should parse");
+        let raw_fraction = positive_record
+            .get(5)
+            .expect("raw_fraction column should exist")
+            .parse::<f64>()
+            .expect("raw_fraction should parse");
+        let unique_fraction = positive_record
+            .get(6)
+            .expect("unique_fraction column should exist")
+            .parse::<f64>()
+            .expect("unique_fraction should parse");
+        let sampled_fraction = accepted_fragments as f64 / written_summary.sampled_fragments as f64;
+        assert!((raw_fraction - sampled_fraction).abs() < 1e-12);
+        assert!((unique_fraction - sampled_fraction).abs() < 1e-12);
+
         let mut rounds_reader = ReaderBuilder::new()
             .delimiter(b'\t')
             .from_path(output_dir.join(ROUNDS_TSV))
@@ -627,9 +650,9 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let output_dir = temp_dir.path().join("report_bundle");
         let mut candidates = candidate_fixtures();
-        candidates[0]
-            .decision_reasons
-            .push(format!("{FRACTION_CI_REASON_PREFIX}{SAMPLING_ONLY_CI_LABEL}"));
+        candidates[0].decision_reasons.push(format!(
+            "{FRACTION_CI_REASON_PREFIX}{SAMPLING_ONLY_CI_LABEL}"
+        ));
 
         let error = ReportWriter::write(
             &output_dir,
@@ -738,8 +761,8 @@ mod tests {
                 accession_or_group: "ebv".into(),
                 accepted_fragments: 27,
                 nonoverlap_fragments: 6,
-                raw_fraction: 0.00012,
-                unique_fraction: 0.00008,
+                raw_fraction: 27.0 / 400_000.0,
+                unique_fraction: 27.0 / 400_000.0,
                 fraction_ci_95: [0.00005, 0.00011],
                 clopper_pearson_upper: 0.00014,
                 breadth: 0.0025,
@@ -759,8 +782,8 @@ mod tests {
                 accession_or_group: "influenza-a".into(),
                 accepted_fragments: 1,
                 nonoverlap_fragments: 1,
-                raw_fraction: 0.00001,
-                unique_fraction: 0.000004,
+                raw_fraction: 1.0 / 400_000.0,
+                unique_fraction: 1.0 / 400_000.0,
                 fraction_ci_95: [0.0, 0.00002],
                 clopper_pearson_upper: 0.00003,
                 breadth: 0.0001,
