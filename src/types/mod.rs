@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub type HotPathId = u64;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(transparent)]
 pub struct BundleManifest(pub Vec<ContigEntry>);
@@ -306,6 +308,17 @@ allow_indeterminate = true
     }
 
     #[test]
+    fn test_representative_candidate_fixture_uses_sampled_domain_fraction() {
+        let summary = sample_summary_fixture();
+        let candidate = candidate_call_fixture();
+        let sampled_fraction =
+            candidate.accepted_fragments as f64 / summary.sampled_fragments as f64;
+
+        assert!((candidate.raw_fraction - sampled_fraction).abs() < 1e-12);
+        assert!((candidate.unique_fraction - sampled_fraction).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_core_enum_serialization() {
         assert_json_roundtrip(DecisionStatus::Positive, "\"positive\"");
         assert_json_roundtrip(DecisionStatus::Negative, "\"negative\"");
@@ -447,8 +460,8 @@ allow_indeterminate = true
             accession_or_group: "ebv".into(),
             accepted_fragments: 27,
             nonoverlap_fragments: 6,
-            raw_fraction: 0.00012,
-            unique_fraction: 0.00008,
+            raw_fraction: 27.0 / 400_000.0,
+            unique_fraction: 27.0 / 400_000.0,
             fraction_ci_95: [0.00005, 0.00011],
             clopper_pearson_upper: 0.00014,
             breadth: 0.0025,
