@@ -49,7 +49,8 @@ pub fn expected_release_status(
     profile_status: &str,
 ) -> Result<ReleaseStatus> {
     let sampling_mode = parse_sampling_mode(sampling_mode)?;
-    let calibration_profile = synthetic_profile(negative_control_required, profile_status, sampling_mode);
+    let calibration_profile =
+        synthetic_profile(negative_control_required, profile_status, sampling_mode);
     Ok(ReleaseGate::evaluate(&ReleaseContext {
         sampling_mode,
         negative_control,
@@ -148,6 +149,8 @@ fn synthetic_profile(
                 ScreenMode::Streaming => "streaming".to_string(),
             },
             rounds: vec![1],
+            round_mode: None,
+            round_proportions: None,
             max_rounds: 1,
         },
         fragment_rules: FragmentRules {
@@ -430,6 +433,8 @@ mod tests {
             sampling: SamplingConfig {
                 mode: "representative".to_string(),
                 rounds: vec![50, 100],
+                round_mode: None,
+                round_proportions: None,
                 max_rounds: 2,
             },
             fragment_rules: FragmentRules {

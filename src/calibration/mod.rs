@@ -1,10 +1,10 @@
 use crate::cli::{CalibrateArgs, ScreenArgs, ScreenMode};
 use crate::error::{Result, RvScreenError};
 use crate::pipeline::run_screen;
-use crate::sampling::DEFAULT_REPRESENTATIVE_ROUNDS;
+use crate::sampling::DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS;
 use crate::types::{
     BundleToml, CandidateRules, DecisionRules, DecisionStatus, FragmentRules, ProfileToml,
-    ReleaseStatus, SamplingConfig,
+    ReleaseStatus, SamplingConfig, SamplingRoundMode,
 };
 use csv::WriterBuilder;
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,9 @@ fn run_benchmark_dataset(
         negative_control: None,
         out: report_dir,
         mode: screen_mode,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: false,
         threads: thread_count,
     };
     let outcome = run_screen(&screen_args)?;
@@ -731,8 +734,10 @@ fn default_threads() -> usize {
 fn default_sampling_config() -> SamplingConfig {
     SamplingConfig {
         mode: "representative".to_string(),
-        rounds: DEFAULT_REPRESENTATIVE_ROUNDS.to_vec(),
-        max_rounds: DEFAULT_REPRESENTATIVE_ROUNDS.len() as u64,
+        rounds: Vec::new(),
+        round_mode: Some(SamplingRoundMode::Proportional),
+        round_proportions: Some(DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.to_vec()),
+        max_rounds: DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.len() as u64,
     }
 }
 
@@ -969,6 +974,64 @@ allow_indeterminate = true
 
         assert_eq!(loaded.profile.profile_id, "rvscreen_calib_2026.04.20-r1");
         assert_eq!(loaded.profile.sampling.rounds, vec![10, 20]);
+        assert_eq!(loaded.profile.sampling.round_mode, None);
+        assert_eq!(loaded.profile.sampling.round_proportions, None);
+    }
+
+    #[test]
+    fn loads_profile_toml_with_proportional_rounds() {
+        let tempdir = tempdir().expect("tempdir should be created");
+        let profile_dir = tempdir.path().join("calibration-proportional");
+        fs::create_dir_all(&profile_dir).expect("profile dir should be created");
+        fs::write(
+            profile_dir.join(PROFILE_TOML),
+            r#"
+profile_id = "rvscreen_calib_2026.04.20-r1"
+status = "release_candidate"
+reference_bundle = "rvscreen_ref_2026.04.20-r1"
+backend = "minimap2"
+preset = "sr-conservative"
+seed = 20260420
+supported_input = ["fastq.gz", "bam", "cram"]
+supported_read_type = ["illumina_pe_shortread"]
+negative_control_required = false
+
+[sampling]
+mode = "representative"
+round_mode = "proportional"
+round_proportions = [0.25, 0.5, 1.0]
+rounds = []
+max_rounds = 3
+
+[fragment_rules]
+min_mapq = 20
+min_as_diff = 12
+max_nm = 8
+require_pair_consistency = true
+
+[candidate_rules]
+min_nonoverlap_fragments = 1
+min_breadth = 0.0
+max_background_ratio = 0.0
+
+[decision_rules]
+theta_pos = 0.00001
+theta_neg = 0.0
+allow_indeterminate = true
+"#,
+        )
+        .expect("profile TOML should be written");
+
+        let loaded = load_profile(&profile_dir).expect("profile should load");
+
+        assert_eq!(
+            loaded.profile.sampling.round_mode,
+            Some(crate::types::SamplingRoundMode::Proportional)
+        );
+        assert_eq!(
+            loaded.profile.sampling.round_proportions,
+            Some(vec![0.25, 0.5, 1.0])
+        );
     }
 
     #[test]
@@ -1039,6 +1102,50 @@ datasets:
     }
 
     #[test]
+    fn generated_profile_defaults_to_proportional_rounds() {
+        let profile =
+            BenchmarkProfileConfig::default().build_profile("2026.04.24", "rvscreen_ref_test");
+        let profile_toml = toml::to_string_pretty(&profile).expect("profile should serialize");
+
+        assert_eq!(profile.sampling.rounds, Vec::<u64>::new());
+        assert_eq!(
+            profile.sampling.round_mode,
+            Some(SamplingRoundMode::Proportional)
+        );
+        assert_eq!(
+            profile.sampling.round_proportions,
+            Some(DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.to_vec())
+        );
+        assert_eq!(
+            profile.sampling.max_rounds,
+            DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.len() as u64
+        );
+        let serialized: toml::Value =
+            toml::from_str(&profile_toml).expect("profile TOML should parse");
+        assert_eq!(
+            serialized["sampling"]["round_mode"].as_str(),
+            Some("proportional")
+        );
+        assert_eq!(
+            serialized["sampling"]["round_proportions"]
+                .as_array()
+                .expect("round_proportions should be an array")
+                .iter()
+                .map(|value| value.as_float().expect("proportion should be a float"))
+                .collect::<Vec<_>>(),
+            DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.to_vec()
+        );
+
+        let evidence_dir = Path::new(".sisyphus/evidence");
+        fs::create_dir_all(evidence_dir).expect("evidence directory should be created");
+        fs::write(
+            evidence_dir.join("task-5-generated-profile.toml"),
+            profile_toml,
+        )
+        .expect("generated profile evidence should be written");
+    }
+
+    #[test]
     fn calibration_generates_profile_and_required_artifacts() {
         let tempdir = tempdir().expect("tempdir should be created");
         let bundle =
@@ -1086,6 +1193,19 @@ datasets:
         )
         .expect("profile.toml should parse");
         assert_eq!(profile.reference_bundle, bundle.version);
+        assert_eq!(profile.sampling.rounds, Vec::<u64>::new());
+        assert_eq!(
+            profile.sampling.round_mode,
+            Some(SamplingRoundMode::Proportional)
+        );
+        assert_eq!(
+            profile.sampling.round_proportions,
+            Some(DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.to_vec())
+        );
+        assert_eq!(
+            profile.sampling.max_rounds,
+            DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.len() as u64
+        );
 
         let benchmark_summary = fs::read_to_string(out_dir.join(BENCHMARK_SUMMARY_TSV))
             .expect("summary should be readable");
@@ -1188,15 +1308,10 @@ datasets:
         fs::write(
             &manifest_path,
             r#"{
-  "profile": {
+    "profile": {
     "supported_input": ["fastq"],
     "supported_read_type": ["illumina_pe_shortread"],
     "negative_control_required": false,
-    "sampling": {
-      "mode": "representative",
-      "rounds": [50, 100],
-      "max_rounds": 2
-    },
     "fragment_rules": {
       "min_mapq": 0,
       "min_as_diff": 0,
