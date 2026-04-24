@@ -1201,6 +1201,8 @@ mod tests {
             sampling: SamplingConfig {
                 mode: sampling_mode.to_string(),
                 rounds: vec![50_000, 100_000],
+                round_mode: None,
+                round_proportions: None,
                 max_rounds: 2,
             },
             fragment_rules: crate::types::FragmentRules {
@@ -1329,6 +1331,7 @@ mod tests {
             backend: "minimap2".to_string(),
             seed: 20_260_421,
             sampling_mode: "representative".to_string(),
+            sampling_round_plan: None,
             negative_control: NegativeControlManifest {
                 required: false,
                 status: NegativeControlStatus::Pass,

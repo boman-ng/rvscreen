@@ -1,5 +1,6 @@
 use crate::testutil::generate_mini_reference;
 use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
+use rvscreen::sampling::DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS;
 use rvscreen::types::{BundleManifest, ContigEntry};
 use std::fs;
 use std::io;
@@ -13,9 +14,43 @@ pub struct ReferenceBundleFixture {
 pub struct CalibrationProfile<'a> {
     pub profile_id: &'a str,
     pub seed: u64,
-    pub rounds: &'a [usize],
+    pub rounds: Option<&'a [usize]>,
+    pub round_mode: Option<&'a str>,
+    pub round_proportions: Option<&'a [f64]>,
     pub max_rounds: usize,
     pub max_background_ratio: f64,
+}
+
+impl<'a> CalibrationProfile<'a> {
+    #[allow(dead_code)]
+    pub fn proportional_default(profile_id: &'a str, seed: u64, max_background_ratio: f64) -> Self {
+        Self {
+            profile_id,
+            seed,
+            rounds: None,
+            round_mode: Some("proportional"),
+            round_proportions: Some(&DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS),
+            max_rounds: DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS.len(),
+            max_background_ratio,
+        }
+    }
+
+    pub fn absolute_override(
+        profile_id: &'a str,
+        seed: u64,
+        rounds: &'a [usize],
+        max_background_ratio: f64,
+    ) -> Self {
+        Self {
+            profile_id,
+            seed,
+            rounds: Some(rounds),
+            round_mode: Some("absolute"),
+            round_proportions: None,
+            max_rounds: rounds.len(),
+            max_background_ratio,
+        }
+    }
 }
 
 pub fn prepare_reference_bundle(base_dir: &Path) -> io::Result<ReferenceBundleFixture> {
@@ -64,15 +99,31 @@ pub fn write_calibration_profile(
 ) -> io::Result<PathBuf> {
     let rounds = config
         .rounds
+        .unwrap_or(&[])
         .iter()
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let round_mode = config
+        .round_mode
+        .map(|mode| format!("round_mode = \"{mode}\"\n"))
+        .unwrap_or_default();
+    let round_proportions = config
+        .round_proportions
+        .map(|proportions| {
+            let proportions = proportions
+                .iter()
+                .map(f64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("round_proportions = [{proportions}]\n")
+        })
+        .unwrap_or_default();
     fs::create_dir_all(&dir)?;
     fs::write(
         dir.join("profile.toml"),
         format!(
-            "profile_id = \"{}\"\nstatus = \"release_candidate\"\nreference_bundle = \"{reference_bundle}\"\nbackend = \"minimap2\"\npreset = \"sr-conservative\"\nseed = {}\nsupported_input = [\"fastq\", \"fastq.gz\", \"bam\", \"ubam\", \"cram\"]\nsupported_read_type = [\"illumina_pe_shortread\"]\nnegative_control_required = false\n\n[sampling]\nmode = \"representative\"\nrounds = [{rounds}]\nmax_rounds = {}\n\n[fragment_rules]\nmin_mapq = 0\nmin_as_diff = 0\nmax_nm = 100\nrequire_pair_consistency = true\n\n[candidate_rules]\nmin_nonoverlap_fragments = 1\nmin_breadth = 0.0\nmax_background_ratio = {}\n\n[decision_rules]\ntheta_pos = 0.01\ntheta_neg = 0.0001\nallow_indeterminate = true\n",
+            "profile_id = \"{}\"\nstatus = \"release_candidate\"\nreference_bundle = \"{reference_bundle}\"\nbackend = \"minimap2\"\npreset = \"sr-conservative\"\nseed = {}\nsupported_input = [\"fastq\", \"fastq.gz\", \"bam\", \"ubam\", \"cram\"]\nsupported_read_type = [\"illumina_pe_shortread\"]\nnegative_control_required = false\n\n[sampling]\nmode = \"representative\"\n{round_mode}{round_proportions}rounds = [{rounds}]\nmax_rounds = {}\n\n[fragment_rules]\nmin_mapq = 0\nmin_as_diff = 0\nmax_nm = 100\nrequire_pair_consistency = true\n\n[candidate_rules]\nmin_nonoverlap_fragments = 1\nmin_breadth = 0.0\nmax_background_ratio = {}\n\n[decision_rules]\ntheta_pos = 0.01\ntheta_neg = 0.0001\nallow_indeterminate = true\n",
             config.profile_id, config.seed, config.max_rounds, config.max_background_ratio
         ),
     )?;

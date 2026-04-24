@@ -1,7 +1,12 @@
+#[path = "../benches/support/mod.rs"]
+mod bench_support;
 #[path = "testutil/mod.rs"]
 mod testutil;
 
 use csv::ReaderBuilder;
+use rvscreen::pipeline::{
+    run_screen, ScreenPerfMetrics, ScreenRunOutcome, REPRESENTATIVE_STARTUP_STAGE_LABELS,
+};
 use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
 use rvscreen::report::ReportWriter;
 use rvscreen::types::{
@@ -744,7 +749,7 @@ fn integration_representative_same_seed_is_deterministic_across_thread_counts() 
         os("1"),
     ]);
 
-    let multi_thread_out = tempdir.path().join("report-thread-4");
+    let multi_thread_out = tempdir.path().join("report-thread-16");
     run_screen_cli([
         os("screen"),
         os("--input"),
@@ -761,7 +766,7 @@ fn integration_representative_same_seed_is_deterministic_across_thread_counts() 
         os("--mode"),
         os("representative"),
         os("--threads"),
-        os("4"),
+        os("16"),
     ]);
 
     assert_eq!(
@@ -780,6 +785,277 @@ fn integration_representative_same_seed_is_deterministic_across_thread_counts() 
         coverage_file_map(&single_thread_out),
         coverage_file_map(&multi_thread_out)
     );
+    println!(
+        "pipeline_threadcount_output_equality threads_1_vs_16=true rounds={:?}",
+        read_round_rows(&single_thread_out)
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn integration_proportional_representative_retains_all_small_dataset_and_warns() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-proportional-small"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![],
+            round_mode: Some("proportional"),
+            round_proportions: Some(vec![0.25, 0.5, 1.0]),
+            max_rounds: 3,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("proportional calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 8405)
+            .with_output_dir(tempdir.path().join("fastq-proportional-small"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+
+    let outcome = run_screen(&rvscreen::cli::ScreenArgs {
+        input: vec![r1, r2],
+        reference_bundle: bundle.bundle_dir,
+        calibration_profile: calibration_dir,
+        negative_control: None,
+        out: tempdir.path().join("report-proportional-small"),
+        mode: rvscreen::cli::ScreenMode::Representative,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: false,
+        threads: 1,
+    })
+    .expect("proportional representative screen should succeed");
+
+    assert_eq!(outcome.summary.qc_passing_fragments, 200);
+    assert_eq!(outcome.summary.sampled_fragments, 200);
+    assert!(outcome
+        .rounds
+        .iter()
+        .all(|round| round.sampled_fragments == 200));
+    assert_eq!(
+        outcome.rounds.last().map(|round| round.sampled_fragments),
+        Some(200)
+    );
+    assert_eq!(outcome.sampling_warnings.len(), 1);
+    assert!(outcome.sampling_warnings[0]
+        .message
+        .contains("retaining all QC-passing fragments"));
+}
+
+#[test]
+fn integration_proportional_report_exposes_resolved_sampling_accounting() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-proportional-report"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![],
+            round_mode: Some("proportional"),
+            round_proportions: Some(vec![0.25, 0.5, 1.0]),
+            max_rounds: 3,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("proportional calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 8410)
+            .with_output_dir(tempdir.path().join("fastq-proportional-report"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-proportional-accounting");
+
+    let outcome = run_screen(&rvscreen::cli::ScreenArgs {
+        input: vec![r1, r2],
+        reference_bundle: bundle.bundle_dir,
+        calibration_profile: calibration_dir,
+        negative_control: None,
+        out: out_dir.clone(),
+        mode: rvscreen::cli::ScreenMode::Representative,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: false,
+        threads: 1,
+    })
+    .expect("proportional representative screen should succeed");
+
+    let manifest = read_json_value(&out_dir.join("run_manifest.json"));
+    let plan = &manifest["sampling_round_plan"];
+    assert_eq!(plan["round_mode"], "proportional");
+    assert_eq!(plan["requested_proportions"], json!([0.25, 0.5, 1.0]));
+    assert_eq!(plan["raw_proportional_counts"], json!([50, 100, 200]));
+    assert_eq!(plan["effective_counts"], json!([200, 200, 200]));
+    assert_eq!(plan["qc_passing_denominator"], 200);
+    assert_eq!(plan["warnings"][0]["kind"], "small_dataset_retained_all");
+    assert!(plan["warnings"][0]["message"]
+        .as_str()
+        .expect("warning message should be a string")
+        .contains("retaining all QC-passing fragments"));
+    assert_eq!(outcome.summary.qc_passing_fragments, 200);
+    assert_eq!(outcome.summary.sampled_fragments, 200);
+
+    write_task_evidence(
+        "task-4-proportional-report.json",
+        &json!({
+            "test": "integration_proportional_report_exposes_resolved_sampling_accounting",
+            "sample_summary": read_json_value(&out_dir.join("sample_summary.json")),
+            "rounds_sampled": read_round_rows(&out_dir)
+                .iter()
+                .map(|round| round.sampled_fragments)
+                .collect::<Vec<_>>(),
+            "sampling_round_plan": plan,
+        }),
+    );
+}
+
+#[test]
+fn integration_proportional_representative_allow_override_warns_and_uses_raw_counts() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-proportional-allow"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![],
+            round_mode: Some("proportional"),
+            round_proportions: Some(vec![0.25, 0.5]),
+            max_rounds: 2,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("proportional calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 8406)
+            .with_output_dir(tempdir.path().join("fastq-proportional-allow"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-proportional-allow");
+
+    let output = run_cli_capture([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--out"),
+        out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+        os("--allow-sampling-threshold-override"),
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_lines = stderr
+        .lines()
+        .filter(|line| line.starts_with("rvscreen_warning "))
+        .collect::<Vec<_>>();
+    for warning_line in &warning_lines {
+        println!("allow_override_warning {warning_line}");
+    }
+    assert_eq!(warning_lines.len(), 2, "{stderr}");
+    assert!(
+        warning_lines
+            .iter()
+            .all(|line| line.contains("kind=sampling_threshold_override")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-sampling-threshold-override"),
+        "{stderr}"
+    );
+    assert_eq!(read_summary(&out_dir).sampled_fragments, 100);
+    assert_eq!(
+        read_round_rows(&out_dir)
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![50, 100]
+    );
+}
+
+#[test]
+fn integration_proportional_representative_is_nested_and_thread_deterministic() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-proportional-determinism"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![],
+            round_mode: Some("proportional"),
+            round_proportions: Some(vec![0.25, 0.5, 1.0]),
+            max_rounds: 3,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("proportional calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(240, 100, 8407)
+            .with_output_dir(tempdir.path().join("fastq-proportional-determinism"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+
+    let single_thread = run_screen(&rvscreen::cli::ScreenArgs {
+        input: vec![r1.clone(), r2.clone()],
+        reference_bundle: bundle.bundle_dir.clone(),
+        calibration_profile: calibration_dir.clone(),
+        negative_control: None,
+        out: tempdir.path().join("report-proportional-thread-1"),
+        mode: rvscreen::cli::ScreenMode::Representative,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: true,
+        threads: 1,
+    })
+    .expect("single-thread proportional screen should succeed");
+    let multi_thread = run_screen(&rvscreen::cli::ScreenArgs {
+        input: vec![r1, r2],
+        reference_bundle: bundle.bundle_dir,
+        calibration_profile: calibration_dir,
+        negative_control: None,
+        out: tempdir.path().join("report-proportional-thread-16"),
+        mode: rvscreen::cli::ScreenMode::Representative,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: true,
+        threads: 16,
+    })
+    .expect("multi-thread proportional screen should succeed");
+
+    assert_eq!(
+        single_thread
+            .rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![60, 120]
+    );
+    assert!(single_thread
+        .rounds
+        .windows(2)
+        .all(|pair| pair[0].sampled_fragments <= pair[1].sampled_fragments));
+    assert_eq!(single_thread.sampling_warnings.len(), 3);
+    assert_screen_outcomes_equal_without_perf(&single_thread, &multi_thread);
+    println!("pipeline_thread_output_equality thread_1_vs_thread_16=true");
 }
 
 #[test]
@@ -850,6 +1126,52 @@ fn integration_representative_small_input_caps_rounds_at_available_qc_fragments(
         "representative rounds must cap at available QC-pass fragments"
     );
     assert!(read_candidate_rows(&out_dir).is_empty());
+}
+
+#[test]
+fn integration_representative_run_returns_required_stage_timings() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-stage-timings"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(48, 100, 8404)
+            .with_output_dir(tempdir.path().join("fastq-stage-timings"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+
+    let outcome = run_screen(&rvscreen::cli::ScreenArgs {
+        input: vec![r1, r2],
+        reference_bundle: bundle.bundle_dir,
+        calibration_profile: calibration_dir,
+        negative_control: None,
+        out: tempdir.path().join("report-stage-timings"),
+        mode: rvscreen::cli::ScreenMode::Representative,
+        rounds: None,
+        round_proportions: None,
+        allow_sampling_threshold_override: false,
+        threads: 1,
+    })
+    .expect("representative screen should succeed");
+
+    let labels = outcome
+        .perf_metrics
+        .stage_timings
+        .iter()
+        .map(|timing| timing.label.as_str())
+        .collect::<BTreeSet<_>>();
+    for label in REPRESENTATIVE_STARTUP_STAGE_LABELS {
+        assert!(labels.contains(label), "missing stage timing label {label}");
+    }
 }
 
 #[test]
@@ -1116,6 +1438,303 @@ fn audit_verify_passes_valid_report_bundle() {
 }
 
 #[test]
+fn integration_run_help_exposes_screen_flags() {
+    let output = Command::new(binary_path())
+        .args([os("run"), os("--help")])
+        .output()
+        .expect("rvscreen run --help should execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("--input"), "{stdout}");
+    assert!(stdout.contains("--reference-bundle"), "{stdout}");
+    assert!(stdout.contains("--calibration-profile"), "{stdout}");
+    assert!(stdout.contains("--out"), "{stdout}");
+    assert!(stdout.contains("representative"), "{stdout}");
+}
+
+#[test]
+fn integration_run_alias_matches_screen_small_input_behavior() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-run-alias"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![50, 100],
+            max_rounds: 2,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("calibration profile should be written");
+    let negative_control =
+        write_negative_control(tempdir.path().join("negative-control.json"), "pass", &[])
+            .expect("negative control should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(12, 100, 8403)
+            .with_output_dir(tempdir.path().join("fastq-run-alias"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("small-input FASTQ should be generated");
+
+    let screen_out_dir = tempdir.path().join("report-screen-alias-parity");
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.clone().into_os_string(),
+        r2.clone().into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.clone().into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.clone().into_os_string(),
+        os("--negative-control"),
+        negative_control.clone().into_os_string(),
+        os("--out"),
+        screen_out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+    ]);
+
+    let run_out_dir = tempdir.path().join("report-run-alias-parity");
+    run_screen_cli([
+        os("run"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--negative-control"),
+        negative_control.into_os_string(),
+        os("--out"),
+        run_out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+    ]);
+
+    let screen_summary = read_summary(&screen_out_dir);
+    let run_summary = read_summary(&run_out_dir);
+    assert_eq!(screen_summary, run_summary);
+    assert_eq!(screen_summary.input_fragments, 12);
+    assert_eq!(screen_summary.qc_passing_fragments, 12);
+    assert_eq!(screen_summary.sampled_fragments, 12);
+
+    let screen_rounds = read_round_rows(&screen_out_dir);
+    let run_rounds = read_round_rows(&run_out_dir);
+    assert_eq!(screen_rounds, run_rounds);
+    assert_eq!(screen_rounds.len(), 2);
+    assert_eq!(
+        screen_rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![12, 12]
+    );
+    assert_eq!(
+        screen_rounds.last().map(|round| round.sampled_fragments),
+        Some(12)
+    );
+
+    let screen_candidates = read_candidate_rows(&screen_out_dir);
+    let run_candidates = read_candidate_rows(&run_out_dir);
+    assert_eq!(screen_candidates, run_candidates);
+    assert!(screen_candidates.is_empty());
+}
+
+#[test]
+fn integration_legacy_profile_rounds_remain_absolute_fragment_counts() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let bundle =
+        prepare_reference_bundle(tempdir.path()).expect("reference bundle should be prepared");
+    let calibration_dir = write_calibration_profile(
+        tempdir.path().join("calibration-legacy-rounds"),
+        &bundle.version,
+        CalibrationProfileOptions {
+            rounds: vec![50, 100],
+            max_rounds: 2,
+            write_passing_release_gate: true,
+            ..CalibrationProfileOptions::default()
+        },
+    )
+    .expect("legacy calibration profile should be written");
+    let (r1, r2) = generate_fastq_pair(
+        &FastqPairConfig::new(200, 100, 4242)
+            .with_output_dir(tempdir.path().join("fastq-legacy-rounds"))
+            .with_components(vec![ReadComponent::new(SyntheticSource::Human, 1.0)]),
+    )
+    .expect("FASTQ should be generated");
+    let out_dir = tempdir.path().join("report-legacy-rounds");
+
+    run_screen_cli([
+        os("screen"),
+        os("--input"),
+        r1.into_os_string(),
+        r2.into_os_string(),
+        os("--reference-bundle"),
+        bundle.bundle_dir.into_os_string(),
+        os("--calibration-profile"),
+        calibration_dir.into_os_string(),
+        os("--out"),
+        out_dir.clone().into_os_string(),
+        os("--mode"),
+        os("representative"),
+    ]);
+
+    let summary = read_summary(&out_dir);
+    let rounds = read_round_rows(&out_dir);
+    let manifest = read_json_value(&out_dir.join("run_manifest.json"));
+    let plan = &manifest["sampling_round_plan"];
+    assert_eq!(summary.sampled_fragments, 100);
+    assert_eq!(summary.qc_passing_fragments, 200);
+    assert_eq!(
+        rounds
+            .iter()
+            .map(|round| round.sampled_fragments)
+            .collect::<Vec<_>>(),
+        vec![50, 100]
+    );
+    assert_eq!(plan["round_mode"], "absolute");
+    assert_eq!(plan["requested_rounds"], json!([50, 100]));
+    assert_eq!(plan["effective_counts"], json!([50, 100]));
+    assert!(plan.get("requested_proportions").is_none());
+
+    write_task_evidence(
+        "task-4-absolute-unchanged.json",
+        &json!({
+            "test": "integration_legacy_profile_rounds_remain_absolute_fragment_counts",
+            "sample_summary": read_json_value(&out_dir.join("sample_summary.json")),
+            "rounds_sampled": rounds
+                .iter()
+                .map(|round| round.sampled_fragments)
+                .collect::<Vec<_>>(),
+            "sampling_round_plan": plan,
+        }),
+    );
+}
+
+#[test]
+fn integration_benchmark_profile_helper_writes_proportional_default_and_absolute_override() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let proportional_dir = bench_support::write_calibration_profile(
+        tempdir.path().join("bench-proportional-default"),
+        "rvscreen_ref_bench_test",
+        &bench_support::CalibrationProfile::proportional_default(
+            "rvscreen_calib_bench_proportional",
+            20260424,
+            0.0,
+        ),
+    )
+    .expect("benchmark proportional profile should be written");
+    let absolute_rounds = [50_usize, 100_usize];
+    let absolute_dir = bench_support::write_calibration_profile(
+        tempdir.path().join("bench-absolute-override"),
+        "rvscreen_ref_bench_test",
+        &bench_support::CalibrationProfile::absolute_override(
+            "rvscreen_calib_bench_absolute",
+            20260424,
+            &absolute_rounds,
+            0.0,
+        ),
+    )
+    .expect("benchmark absolute profile should be written");
+
+    let proportional_profile = fs::read_to_string(proportional_dir.join("profile.toml"))
+        .expect("benchmark proportional profile should be readable");
+    assert!(proportional_profile.contains("round_mode = \"proportional\""));
+    assert!(
+        proportional_profile.contains("round_proportions = [0.002, 0.005, 0.01, 0.02, 0.05, 0.1]")
+    );
+    assert!(proportional_profile.contains("rounds = []"));
+
+    let absolute_profile = fs::read_to_string(absolute_dir.join("profile.toml"))
+        .expect("benchmark absolute profile should be readable");
+    assert!(absolute_profile.contains("round_mode = \"absolute\""));
+    assert!(absolute_profile.contains("rounds = [50, 100]"));
+    assert!(!absolute_profile.contains("round_proportions"));
+
+    let evidence_dir = Path::new(".sisyphus/evidence");
+    fs::create_dir_all(evidence_dir).expect("evidence directory should be created");
+    fs::write(
+        evidence_dir.join("task-5-bench-absolute.txt"),
+        format!(
+            "benchmark helper absolute override profile:\n{}\ncontains_round_proportions={}\n",
+            absolute_profile,
+            absolute_profile.contains("round_proportions")
+        ),
+    )
+    .expect("benchmark absolute evidence should be written");
+}
+
+#[test]
+fn integration_mixed_cli_round_overrides_are_rejected_before_file_loading() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let output = Command::new(binary_path())
+        .args([
+            os("screen"),
+            os("--input"),
+            os("reads.fastq"),
+            os("--reference-bundle"),
+            tempdir.path().join("missing-reference").into_os_string(),
+            os("--calibration-profile"),
+            tempdir.path().join("missing-profile").into_os_string(),
+            os("--out"),
+            tempdir.path().join("report").into_os_string(),
+            os("--rounds"),
+            os("10,20"),
+            os("--round-proportions"),
+            os("0.2%,0.5%"),
+        ])
+        .output()
+        .expect("rvscreen screen should execute");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("--rounds"), "{stderr}");
+    assert!(stderr.contains("--round-proportions"), "{stderr}");
+    assert!(stderr.contains("mutually exclusive"), "{stderr}");
+    assert!(
+        !stderr.contains("missing-reference"),
+        "mixed override validation should happen before file loading: {stderr}"
+    );
+}
+
+#[test]
+fn integration_missing_reference_preserves_reference_error_without_timing_panic() {
+    let tempdir = tempdir().expect("tempdir should be created");
+    let output = Command::new(binary_path())
+        .args([
+            os("screen"),
+            os("--input"),
+            os("reads_R1.fastq"),
+            os("reads_R2.fastq"),
+            os("--reference-bundle"),
+            tempdir.path().join("missing-reference").into_os_string(),
+            os("--calibration-profile"),
+            tempdir.path().join("missing-profile").into_os_string(),
+            os("--out"),
+            tempdir.path().join("report").into_os_string(),
+            os("--mode"),
+            os("representative"),
+        ])
+        .output()
+        .expect("rvscreen screen should execute");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("missing-reference"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("stage"), "{stderr}");
+}
+
+#[test]
 fn audit_verify_missing_file_returns_exit_code_1() {
     let tempdir = tempdir().expect("tempdir should be created");
     let fixture = write_audit_verify_fixture(tempdir.path(), "rvscreen_ref_2026.04.21-r1")
@@ -1303,6 +1922,8 @@ fn write_calibration_profile_stub(dir: &Path, reference_version: &str) -> io::Re
             sampling: SamplingConfig {
                 mode: "representative".to_string(),
                 rounds: vec![50_000, 100_000],
+                round_mode: None,
+                round_proportions: None,
                 max_rounds: 2,
             },
             fragment_rules: rvscreen::types::FragmentRules {
@@ -1354,6 +1975,7 @@ fn audit_run_manifest(reference_version: &str) -> RunManifest {
         backend: "minimap2".to_string(),
         seed: 20_260_421,
         sampling_mode: "representative".to_string(),
+        sampling_round_plan: None,
         negative_control: NegativeControlManifest {
             required: false,
             status: NegativeControlStatus::Pass,
@@ -1415,6 +2037,8 @@ struct CalibrationProfileOptions {
     write_passing_release_gate: bool,
     sampling_mode: &'static str,
     rounds: Vec<u64>,
+    round_mode: Option<&'static str>,
+    round_proportions: Option<Vec<f64>>,
     max_rounds: u64,
     theta_pos: f64,
     theta_neg: f64,
@@ -1428,6 +2052,8 @@ impl Default for CalibrationProfileOptions {
             write_passing_release_gate: false,
             sampling_mode: "representative",
             rounds: vec![50, 100],
+            round_mode: None,
+            round_proportions: None,
             max_rounds: 2,
             theta_pos: 0.01,
             theta_neg: 0.0001,
@@ -1447,12 +2073,30 @@ fn write_calibration_profile(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let round_mode = options
+        .round_mode
+        .map(|mode| format!("round_mode = \"{mode}\"\n"))
+        .unwrap_or_default();
+    let round_proportions = options
+        .round_proportions
+        .as_deref()
+        .map(|proportions| {
+            let proportions = proportions
+                .iter()
+                .map(f64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("round_proportions = [{proportions}]\n")
+        })
+        .unwrap_or_default();
     fs::write(
         dir.join("profile.toml"),
         format!(
-            "profile_id = \"rvscreen_calib_test\"\nstatus = \"release_candidate\"\nreference_bundle = \"{reference_bundle}\"\nbackend = \"minimap2\"\npreset = \"sr-conservative\"\nseed = 20260420\nsupported_input = [\"fastq\", \"fastq.gz\", \"bam\", \"ubam\", \"cram\"]\nsupported_read_type = [\"illumina_pe_shortread\"]\nnegative_control_required = {}\n\n[sampling]\nmode = \"{}\"\nrounds = [{}]\nmax_rounds = {}\n\n[fragment_rules]\nmin_mapq = 0\nmin_as_diff = 0\nmax_nm = 100\nrequire_pair_consistency = true\n\n[candidate_rules]\nmin_nonoverlap_fragments = 1\nmin_breadth = 0.0\nmax_background_ratio = {}\n\n[decision_rules]\ntheta_pos = {}\ntheta_neg = {}\nallow_indeterminate = true\n",
+            "profile_id = \"rvscreen_calib_test\"\nstatus = \"release_candidate\"\nreference_bundle = \"{reference_bundle}\"\nbackend = \"minimap2\"\npreset = \"sr-conservative\"\nseed = 20260420\nsupported_input = [\"fastq\", \"fastq.gz\", \"bam\", \"ubam\", \"cram\"]\nsupported_read_type = [\"illumina_pe_shortread\"]\nnegative_control_required = {}\n\n[sampling]\nmode = \"{}\"\n{}{}rounds = [{}]\nmax_rounds = {}\n\n[fragment_rules]\nmin_mapq = 0\nmin_as_diff = 0\nmax_nm = 100\nrequire_pair_consistency = true\n\n[candidate_rules]\nmin_nonoverlap_fragments = 1\nmin_breadth = 0.0\nmax_background_ratio = {}\n\n[decision_rules]\ntheta_pos = {}\ntheta_neg = {}\nallow_indeterminate = true\n",
             options.negative_control_required,
             options.sampling_mode,
+            round_mode,
+            round_proportions,
             rounds,
             options.max_rounds,
             options.max_background_ratio,
@@ -1681,6 +2325,15 @@ fn run_cli(args: impl IntoIterator<Item = OsString>) {
     let _ = run_cli_capture(args);
 }
 
+fn assert_screen_outcomes_equal_without_perf(left: &ScreenRunOutcome, right: &ScreenRunOutcome) {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.perf_metrics = ScreenPerfMetrics::default();
+    right.perf_metrics = ScreenPerfMetrics::default();
+
+    assert_eq!(left, right);
+}
+
 fn binary_path() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_rvscreen")
         .map(PathBuf::from)
@@ -1693,6 +2346,21 @@ fn read_summary(report_dir: &Path) -> SampleSummary {
             .expect("sample_summary.json should be readable"),
     )
     .expect("sample summary JSON should parse")
+}
+
+fn read_json_value(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("JSON artifact should be readable"))
+        .expect("JSON artifact should parse")
+}
+
+fn write_task_evidence(file_name: &str, value: &serde_json::Value) {
+    let evidence_dir = Path::new(".sisyphus/evidence");
+    fs::create_dir_all(evidence_dir).expect("evidence directory should be created");
+    fs::write(
+        evidence_dir.join(file_name),
+        serde_json::to_vec_pretty(value).expect("task evidence should serialize"),
+    )
+    .expect("task evidence should be written");
 }
 
 #[derive(Debug, Deserialize, PartialEq)]

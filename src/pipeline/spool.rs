@@ -207,4 +207,24 @@ mod tests {
             .to_string()
             .contains("expected sequence 0, but received 1"));
     }
+
+    #[test]
+    fn representative_round_spool_accepts_duplicate_and_zero_prefixes() {
+        let spool = RepresentativeRoundSpool::new(vec![0, 10, 10, 25])
+            .expect("proportional effective prefixes may be non-decreasing");
+
+        assert_eq!(spool.round_count(), 4);
+        assert_eq!(
+            RepresentativeRoundSpool::entry_round_for_prefix_index(&[0, 10, 10, 25], 0),
+            Some(1)
+        );
+        assert_eq!(
+            RepresentativeRoundSpool::entry_round_for_prefix_index(&[0, 10, 10, 25], 9),
+            Some(1)
+        );
+        assert_eq!(
+            RepresentativeRoundSpool::entry_round_for_prefix_index(&[0, 10, 10, 25], 10),
+            Some(3)
+        );
+    }
 }

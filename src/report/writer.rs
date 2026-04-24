@@ -723,6 +723,7 @@ mod tests {
             backend: "minimap2".into(),
             seed: 20_260_420,
             sampling_mode: "representative".into(),
+            sampling_round_plan: None,
             negative_control: crate::types::NegativeControlManifest {
                 required: false,
                 status: crate::types::NegativeControlStatus::Pass,

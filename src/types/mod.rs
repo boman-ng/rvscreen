@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub type HotPathId = u64;
 
@@ -44,11 +44,66 @@ pub struct ProfileToml {
     pub decision_rules: DecisionRules,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SamplingRoundMode {
+    Absolute,
+    Proportional,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SamplingConfig {
     pub mode: String,
     pub rounds: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_mode: Option<SamplingRoundMode>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_round_proportions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub round_proportions: Option<Vec<f64>>,
     pub max_rounds: u64,
+}
+
+pub fn validate_round_proportion_values(proportions: &[f64]) -> std::result::Result<(), String> {
+    let mut previous = None;
+    for (index, value) in proportions.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "sampling.round_proportions[{index}] must be finite"
+            ));
+        }
+        if value <= 0.0 || value > 1.0 {
+            return Err(format!(
+                "sampling.round_proportions[{index}] must be greater than 0 and less than or equal to 1.0"
+            ));
+        }
+        if let Some(previous) = previous {
+            if value <= previous {
+                return Err(
+                    "sampling.round_proportions must be strictly increasing after parsing"
+                        .to_string(),
+                );
+            }
+        }
+        previous = Some(value);
+    }
+
+    Ok(())
+}
+
+fn deserialize_round_proportions<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<f64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let proportions = Option::<Vec<f64>>::deserialize(deserializer)?;
+    if let Some(proportions) = proportions.as_deref() {
+        validate_round_proportion_values(proportions).map_err(serde::de::Error::custom)?;
+    }
+    Ok(proportions)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -164,8 +219,34 @@ pub struct RunManifest {
     pub backend: String,
     pub seed: u64,
     pub sampling_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_round_plan: Option<SamplingRoundPlanReport>,
     pub negative_control: NegativeControlManifest,
     pub input_files: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SamplingRoundPlanReport {
+    pub round_mode: SamplingRoundMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_rounds: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_proportions: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_proportional_counts: Option<Vec<u64>>,
+    pub effective_counts: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qc_passing_denominator: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SamplingWarningReport>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SamplingWarningReport {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<usize>,
+    pub message: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -233,11 +314,126 @@ allow_indeterminate = true
             parsed.sampling.rounds,
             vec![50_000, 100_000, 200_000, 400_000, 800_000]
         );
+        assert_eq!(parsed.sampling.round_mode, None);
+        assert_eq!(parsed.sampling.round_proportions, None);
 
         let roundtrip = toml::to_string(&parsed).expect("profile TOML should serialize");
         let reparsed: ProfileToml =
             toml::from_str(&roundtrip).expect("round-tripped profile TOML should parse");
         assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn test_profile_toml_roundtrip_with_proportional_rounds() {
+        let input = r#"
+profile_id = "rvscreen_calib_2026.04.20-r1"
+status = "release_candidate"
+reference_bundle = "rvscreen_ref_2026.04.20-r1"
+backend = "minimap2"
+preset = "sr-conservative"
+seed = 20260420
+supported_input = ["fastq.gz", "ubam", "bam", "cram"]
+supported_read_type = ["illumina_pe_shortread"]
+negative_control_required = true
+
+[sampling]
+mode = "representative"
+round_mode = "proportional"
+round_proportions = [0.25, 0.5, 1.0]
+rounds = []
+max_rounds = 3
+
+[fragment_rules]
+min_mapq = 20
+min_as_diff = 12
+max_nm = 8
+require_pair_consistency = true
+
+[candidate_rules]
+min_nonoverlap_fragments = 3
+min_breadth = 0.001
+max_background_ratio = 1.5
+
+[decision_rules]
+theta_pos = 0.00005
+theta_neg = 0.000005
+allow_indeterminate = true
+"#;
+
+        let parsed: ProfileToml = toml::from_str(input).expect("profile TOML should parse");
+        assert_eq!(
+            parsed.sampling.round_mode,
+            Some(SamplingRoundMode::Proportional)
+        );
+        assert_eq!(
+            parsed.sampling.round_proportions,
+            Some(vec![0.25, 0.5, 1.0])
+        );
+
+        let roundtrip = toml::to_string(&parsed).expect("profile TOML should serialize");
+        assert!(roundtrip.contains("round_mode = \"proportional\""));
+        assert!(roundtrip.contains("round_proportions = [0.25, 0.5, 1.0]"));
+        let reparsed: ProfileToml =
+            toml::from_str(&roundtrip).expect("round-tripped profile TOML should parse");
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn test_profile_toml_rejects_invalid_round_proportions() {
+        for (body, expected) in [
+            (
+                "round_proportions = [0.0]",
+                "greater than 0 and less than or equal to 1.0",
+            ),
+            (
+                "round_proportions = [1.2]",
+                "greater than 0 and less than or equal to 1.0",
+            ),
+            ("round_proportions = [0.5, 0.5]", "strictly increasing"),
+            ("round_proportions = [0.5, 0.4]", "strictly increasing"),
+            ("round_proportions = [nan]", "finite"),
+            ("round_proportions = [0.5, inf]", "finite"),
+        ] {
+            let input = format!(
+                r#"
+profile_id = "rvscreen_calib_2026.04.20-r1"
+status = "release_candidate"
+reference_bundle = "rvscreen_ref_2026.04.20-r1"
+backend = "minimap2"
+preset = "sr-conservative"
+seed = 20260420
+supported_input = ["fastq.gz"]
+supported_read_type = ["illumina_pe_shortread"]
+negative_control_required = true
+
+[sampling]
+mode = "representative"
+{body}
+rounds = []
+max_rounds = 2
+
+[fragment_rules]
+min_mapq = 20
+min_as_diff = 12
+max_nm = 8
+require_pair_consistency = true
+
+[candidate_rules]
+min_nonoverlap_fragments = 3
+min_breadth = 0.001
+max_background_ratio = 1.5
+
+[decision_rules]
+theta_pos = 0.00005
+theta_neg = 0.000005
+allow_indeterminate = true
+"#
+            );
+
+            let error = toml::from_str::<ProfileToml>(&input)
+                .expect_err("invalid round proportions should be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -391,6 +587,7 @@ allow_indeterminate = true
             backend: "minimap2".into(),
             seed: 20_260_420,
             sampling_mode: "representative".into(),
+            sampling_round_plan: None,
             negative_control: NegativeControlManifest {
                 required: true,
                 status: NegativeControlStatus::Pass,

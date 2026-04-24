@@ -20,7 +20,7 @@ use testutil::{
 };
 
 const BENCH_FRAGMENT_COUNT: usize = 32_000;
-const DEFAULT_THREADS: [usize; 2] = [1, 4];
+const DEFAULT_THREADS: [usize; 2] = [1, 16];
 const DEFAULT_SUMMARY_REPEATS: usize = 5;
 const CI_SUMMARY_REPEATS: usize = 3;
 const DEFAULT_SUMMARY_PATH: &str = "target/criterion/representative_screen_summary.tsv";
@@ -107,13 +107,12 @@ impl BenchmarkFixture {
         let calibration_dir = write_calibration_profile(
             base_dir.join("calibration"),
             &bundle.version,
-            &CalibrationProfile {
-                profile_id: "rvscreen_calib_representative_screen_bench",
-                seed: 20260420,
-                rounds: &[BENCH_FRAGMENT_COUNT],
-                max_rounds: 1,
-                max_background_ratio: 0.0,
-            },
+            &CalibrationProfile::absolute_override(
+                "rvscreen_calib_representative_screen_bench",
+                20260420,
+                &[BENCH_FRAGMENT_COUNT],
+                0.0,
+            ),
         )?;
         let (r1, r2) = generate_fastq_pair(
             &FastqPairConfig::new(BENCH_FRAGMENT_COUNT, 100, 2401)
@@ -146,6 +145,9 @@ impl BenchmarkFixture {
             negative_control: None,
             out,
             mode: ScreenMode::Representative,
+            rounds: None,
+            round_proportions: None,
+            allow_sampling_threshold_override: false,
             threads,
         }
     }
