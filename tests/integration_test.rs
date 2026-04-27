@@ -23,10 +23,11 @@ use rvscreen::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -674,29 +675,27 @@ fn integration_reproducibility_same_seed_same_outputs() {
         os("representative"),
     ]);
 
+    assert_report_bundle_artifacts(&first_out);
+    assert_report_bundle_artifacts(&second_out);
+
     assert_eq!(read_summary(&first_out), read_summary(&second_out));
-    assert_eq!(
-        fs::read_to_string(first_out.join("candidate_calls.tsv"))
-            .expect("first candidate_calls.tsv should be readable"),
-        fs::read_to_string(second_out.join("candidate_calls.tsv"))
-            .expect("second candidate_calls.tsv should be readable")
-    );
-    assert_eq!(
-        fs::read_to_string(first_out.join("rounds.tsv"))
-            .expect("first rounds.tsv should be readable"),
-        fs::read_to_string(second_out.join("rounds.tsv"))
-            .expect("second rounds.tsv should be readable")
-    );
-    assert_eq!(
-        fs::read_to_string(first_out.join("run_manifest.json"))
-            .expect("first run_manifest.json should be readable"),
-        fs::read_to_string(second_out.join("run_manifest.json"))
-            .expect("second run_manifest.json should be readable")
-    );
+    for artifact in DETERMINISTIC_REPORT_DATA_ARTIFACTS {
+        assert_artifact_bytes_equal(&first_out, &second_out, artifact);
+    }
     assert_eq!(
         coverage_file_map(&first_out),
         coverage_file_map(&second_out)
     );
+    assert_eq!(
+        canonical_coverage_file_map(&first_out),
+        canonical_coverage_file_map(&second_out)
+    );
+    validate_run_ndjson_schema(&first_out.join("logs/run.ndjson"));
+    validate_run_ndjson_schema(&second_out.join("logs/run.ndjson"));
+    assert_checksum_manifest_valid_and_complete(&first_out, "checksum.sha256");
+    assert_checksum_manifest_valid_and_complete(&first_out, "audit/checksum.sha256");
+    assert_checksum_manifest_valid_and_complete(&second_out, "checksum.sha256");
+    assert_checksum_manifest_valid_and_complete(&second_out, "audit/checksum.sha256");
 }
 
 #[test]
@@ -2423,15 +2422,47 @@ fn assert_candidate_accessions(report_dir: &Path, expected: &[&str]) {
     }
 }
 
+const DETERMINISTIC_REPORT_DATA_ARTIFACTS: &[&str] = &[
+    "sample_summary.json",
+    "summary/sample_run_summary.json",
+    "summary/result_overview.json",
+    "summary/virus_summary.tsv",
+    "candidate_calls.tsv",
+    "results/candidate_calls.accession.tsv",
+    "rounds.tsv",
+    "results/sampling_rounds.tsv",
+    "run_manifest.json",
+    "provenance/run_manifest.json",
+    "audit/schema_versions.json",
+    "audit/release_gate.json",
+];
+
+const LEGACY_REPORT_ARTIFACTS: &[&str] = &[
+    "sample_summary.json",
+    "candidate_calls.tsv",
+    "rounds.tsv",
+    "run_manifest.json",
+    "checksum.sha256",
+    "logs/run.log",
+];
+
+const CANONICAL_REPORT_FILE_ARTIFACTS: &[&str] = &[
+    "summary/sample_run_summary.json",
+    "summary/result_overview.json",
+    "summary/virus_summary.tsv",
+    "results/candidate_calls.accession.tsv",
+    "results/sampling_rounds.tsv",
+    "provenance/run_manifest.json",
+    "audit/checksum.sha256",
+    "audit/schema_versions.json",
+    "audit/release_gate.json",
+    "logs/run.ndjson",
+];
+
+const CANONICAL_REPORT_DIR_ARTIFACTS: &[&str] = &["evidence/positive_candidate_coverage"];
+
 fn assert_report_bundle_artifacts(report_dir: &Path) {
-    for artifact in [
-        "sample_summary.json",
-        "candidate_calls.tsv",
-        "checksum.sha256",
-        "run_manifest.json",
-        "rounds.tsv",
-        "logs/run.log",
-    ] {
+    for artifact in LEGACY_REPORT_ARTIFACTS {
         assert!(
             report_dir.join(artifact).exists(),
             "missing report artifact {artifact}"
@@ -2441,6 +2472,179 @@ fn assert_report_bundle_artifacts(report_dir: &Path) {
         report_dir.join("coverage").is_dir(),
         "coverage dir should exist"
     );
+    for artifact in CANONICAL_REPORT_FILE_ARTIFACTS {
+        assert!(
+            report_dir.join(artifact).is_file(),
+            "missing canonical report file {artifact}"
+        );
+    }
+    for artifact in CANONICAL_REPORT_DIR_ARTIFACTS {
+        assert!(
+            report_dir.join(artifact).is_dir(),
+            "missing canonical report directory {artifact}"
+        );
+    }
+
+    assert_eq!(
+        fs::read(report_dir.join("candidate_calls.tsv"))
+            .expect("legacy candidate_calls.tsv should be readable"),
+        fs::read(report_dir.join("results/candidate_calls.accession.tsv"))
+            .expect("canonical candidate calls should be readable")
+    );
+    assert_eq!(
+        fs::read(report_dir.join("rounds.tsv")).expect("legacy rounds.tsv should be readable"),
+        fs::read(report_dir.join("results/sampling_rounds.tsv"))
+            .expect("canonical sampling rounds should be readable")
+    );
+    assert_eq!(
+        fs::read(report_dir.join("run_manifest.json"))
+            .expect("legacy run_manifest.json should be readable"),
+        fs::read(report_dir.join("provenance/run_manifest.json"))
+            .expect("canonical run manifest should be readable")
+    );
+    validate_run_ndjson_schema(&report_dir.join("logs/run.ndjson"));
+    assert_checksum_manifest_valid_and_complete(report_dir, "checksum.sha256");
+    assert_checksum_manifest_valid_and_complete(report_dir, "audit/checksum.sha256");
+}
+
+fn assert_artifact_bytes_equal(left_dir: &Path, right_dir: &Path, artifact: &str) {
+    let left = fs::read(left_dir.join(artifact))
+        .unwrap_or_else(|error| panic!("left artifact {artifact} should be readable: {error}"));
+    let right = fs::read(right_dir.join(artifact))
+        .unwrap_or_else(|error| panic!("right artifact {artifact} should be readable: {error}"));
+    assert_eq!(left, right, "deterministic artifact differs: {artifact}");
+}
+
+fn validate_run_ndjson_schema(path: &Path) {
+    let body = fs::read_to_string(path).expect("logs/run.ndjson should be readable");
+    let mut line_count = 0;
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        line_count += 1;
+        let event: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("run.ndjson line should parse as JSON: {error}: {line}")
+        });
+        assert!(
+            event["timestamp_unix_ms"].is_u64(),
+            "run.ndjson event should include numeric timestamp_unix_ms: {event}"
+        );
+        assert!(
+            event["level"].is_string(),
+            "run.ndjson event should include string level: {event}"
+        );
+        assert!(
+            event["event"].is_string(),
+            "run.ndjson event should include string event name: {event}"
+        );
+    }
+    assert!(line_count > 0, "logs/run.ndjson should contain events");
+}
+
+fn assert_checksum_manifest_valid_and_complete(report_dir: &Path, checksum_path: &str) {
+    let manifest = checksum_manifest(report_dir, checksum_path);
+    let expected_inventory = expected_checksum_inventory(report_dir);
+    let actual_inventory = manifest.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_inventory, expected_inventory,
+        "checksum inventory mismatch for {checksum_path}"
+    );
+
+    for (relative_path, expected_digest) in manifest {
+        let file_path = report_dir.join(&relative_path);
+        assert!(
+            file_path.is_file(),
+            "checksum entry should point at a file: {relative_path}"
+        );
+        let observed_digest = sha256_file_hex(&file_path);
+        assert_eq!(
+            observed_digest, expected_digest,
+            "checksum digest mismatch for {relative_path}"
+        );
+    }
+}
+
+fn checksum_manifest(report_dir: &Path, checksum_path: &str) -> BTreeMap<String, String> {
+    let body = fs::read_to_string(report_dir.join(checksum_path))
+        .unwrap_or_else(|error| panic!("{checksum_path} should be readable: {error}"));
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (digest, relative_path) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("checksum line should use two-space separator: {line}"));
+            assert_eq!(
+                digest.len(),
+                64,
+                "checksum digest should be sha256 hex: {line}"
+            );
+            assert!(
+                digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+                "checksum digest should contain only hex digits: {line}"
+            );
+            assert!(
+                relative_path != "checksum.sha256" && relative_path != "audit/checksum.sha256",
+                "checksum manifests must not include checksum files"
+            );
+            (relative_path.to_string(), digest.to_string())
+        })
+        .collect()
+}
+
+fn expected_checksum_inventory(report_dir: &Path) -> BTreeSet<String> {
+    let mut expected = BTreeSet::new();
+    for artifact in LEGACY_REPORT_ARTIFACTS
+        .iter()
+        .copied()
+        .chain(CANONICAL_REPORT_FILE_ARTIFACTS.iter().copied())
+    {
+        if artifact != "checksum.sha256" && artifact != "audit/checksum.sha256" {
+            expected.insert(artifact.to_string());
+        }
+    }
+    collect_files_relative(report_dir, Path::new("coverage"), &mut expected);
+    collect_files_relative(
+        report_dir,
+        Path::new("evidence/positive_candidate_coverage"),
+        &mut expected,
+    );
+    expected
+}
+
+fn collect_files_relative(report_dir: &Path, relative_dir: &Path, files: &mut BTreeSet<String>) {
+    let absolute_dir = report_dir.join(relative_dir);
+    if !absolute_dir.is_dir() {
+        return;
+    }
+    for entry in fs::read_dir(&absolute_dir)
+        .unwrap_or_else(|error| panic!("{} should be readable: {error}", relative_dir.display()))
+    {
+        let entry = entry.expect("report artifact directory entry should be readable");
+        let path = entry.path();
+        let relative_path = relative_dir.join(entry.file_name());
+        if path.is_dir() {
+            collect_files_relative(report_dir, &relative_path, files);
+        } else if path.is_file() {
+            files.insert(relative_path.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
+fn sha256_file_hex(path: &Path) -> String {
+    let mut file = fs::File::open(path)
+        .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("{} should be hashable: {error}", path.display()));
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn coverage_file_map(report_dir: &Path) -> BTreeMap<String, String> {
@@ -2457,6 +2661,25 @@ fn coverage_file_map(report_dir: &Path) -> BTreeMap<String, String> {
             (
                 entry.file_name().to_string_lossy().into_owned(),
                 fs::read_to_string(path).expect("coverage file should be readable"),
+            )
+        })
+        .collect()
+}
+
+fn canonical_coverage_file_map(report_dir: &Path) -> BTreeMap<String, String> {
+    let coverage_dir = report_dir.join("evidence/positive_candidate_coverage");
+    if !coverage_dir.is_dir() {
+        return BTreeMap::new();
+    }
+
+    fs::read_dir(&coverage_dir)
+        .expect("canonical coverage dir should be readable")
+        .map(|entry| {
+            let entry = entry.expect("canonical coverage dir entry should be readable");
+            let path = entry.path();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read_to_string(path).expect("canonical coverage file should be readable"),
             )
         })
         .collect()
