@@ -1,5 +1,6 @@
 pub(crate) mod contract;
-mod writer;
+pub(crate) mod summary;
+pub(crate) mod writer;
 
 use crate::error::Result;
 use crate::types::{CandidateCall, RoundRecord, RunManifest, SampleSummary};
