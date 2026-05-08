@@ -1,4 +1,4 @@
-use crate::aggregate::CandidateAggregator;
+use crate::aggregate::CandidateAggregationPair;
 use crate::align::FragmentAlignResult;
 use crate::error::{Result, RvScreenError};
 use crate::types::FragmentClass;
@@ -13,7 +13,7 @@ use crate::types::FragmentClass;
 #[derive(Debug)]
 pub(crate) struct RepresentativeRoundSpool {
     delta_sampled_fragments: Vec<u64>,
-    delta_aggregators: Vec<CandidateAggregator>,
+    delta_aggregators: Vec<CandidateAggregationPair>,
     next_batch_sequence: usize,
 }
 
@@ -26,7 +26,7 @@ pub(crate) struct RepresentativeBatchDelta {
 #[derive(Debug)]
 pub(crate) struct RepresentativeRoundContribution {
     pub sampled_fragments: u64,
-    pub aggregator: CandidateAggregator,
+    pub aggregators: CandidateAggregationPair,
 }
 
 impl RepresentativeRoundSpool {
@@ -57,7 +57,7 @@ impl RepresentativeRoundSpool {
 
         Ok(Self {
             delta_sampled_fragments: vec![0; round_count],
-            delta_aggregators: vec![CandidateAggregator::new(); round_count],
+            delta_aggregators: vec![CandidateAggregationPair::new(); round_count],
             next_batch_sequence: 0,
         })
     }
@@ -105,7 +105,7 @@ impl RepresentativeRoundSpool {
         for (round_index, contribution) in batch_delta.round_deltas.into_iter().enumerate() {
             self.delta_sampled_fragments[round_index] = self.delta_sampled_fragments[round_index]
                 .saturating_add(contribution.sampled_fragments);
-            self.delta_aggregators[round_index].merge_from(contribution.aggregator)?;
+            self.delta_aggregators[round_index].merge_from(contribution.aggregators)?;
         }
 
         self.next_batch_sequence = self.next_batch_sequence.saturating_add(1);
@@ -117,9 +117,9 @@ impl RepresentativeRoundSpool {
             .into_iter()
             .zip(self.delta_aggregators)
             .map(
-                |(sampled_fragments, aggregator)| RepresentativeRoundContribution {
+                |(sampled_fragments, aggregators)| RepresentativeRoundContribution {
                     sampled_fragments,
-                    aggregator,
+                    aggregators,
                 },
             )
             .collect()
@@ -133,7 +133,7 @@ impl RepresentativeBatchDelta {
             round_deltas: (0..round_count)
                 .map(|_| RepresentativeRoundContribution {
                     sampled_fragments: 0,
-                    aggregator: CandidateAggregator::new(),
+                    aggregators: CandidateAggregationPair::new(),
                 })
                 .collect(),
         }
@@ -164,7 +164,7 @@ impl RepresentativeBatchDelta {
             .expect("validated representative batch round index should exist");
 
         contribution.sampled_fragments = contribution.sampled_fragments.saturating_add(1);
-        contribution.aggregator.add_fragment(class, align_result)
+        contribution.aggregators.add_fragment(class, align_result)
     }
 }
 

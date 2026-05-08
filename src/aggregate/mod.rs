@@ -5,7 +5,10 @@ use crate::decision::ProportionEstimate;
 use crate::error::{Result, RvScreenError};
 use crate::qc::QcStats;
 use crate::types::{CandidateCall, DecisionStatus, EvidenceStrength, FragmentClass, HotPathId};
-use interval::{covered_bases, merge_intervals, Interval};
+use interval::{
+    covered_bases, max_nonoverlapping_intervals, merge_intervals, Interval,
+    NONOVERLAP_FRAGMENTS_ALGORITHM,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +24,12 @@ pub struct CandidateAggregator {
     total_sampled_fragments: Option<u64>,
     fragments_seen: u64,
     candidates: BTreeMap<HotPathId, CandidateAccumulator>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateAggregationPair {
+    pub accession: CandidateAggregator,
+    pub group: CandidateAggregator,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +162,49 @@ impl CandidateAggregator {
     }
 }
 
+impl Default for CandidateAggregationPair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CandidateAggregationPair {
+    pub fn new() -> Self {
+        Self {
+            accession: CandidateAggregator::new(),
+            group: CandidateAggregator::with_level(AggregationLevel::VirusGroup),
+        }
+    }
+
+    pub fn add_fragment(
+        &mut self,
+        class: FragmentClass,
+        align_result: &FragmentAlignResult,
+    ) -> Result<()> {
+        self.accession.add_fragment(class.clone(), align_result)?;
+        self.group.add_fragment(class, align_result)
+    }
+
+    pub(crate) fn merge_from(&mut self, other: Self) -> Result<()> {
+        self.accession.merge_from(other.accession)?;
+        self.group.merge_from(other.group)
+    }
+
+    pub fn set_total_sampled_fragments(&mut self, total_sampled_fragments: u64) {
+        self.accession
+            .set_total_sampled_fragments(total_sampled_fragments);
+        self.group
+            .set_total_sampled_fragments(total_sampled_fragments);
+    }
+
+    pub fn finalize(&self, qc_stats: &QcStats) -> (Vec<CandidateCall>, Vec<CandidateCall>) {
+        (
+            self.accession.finalize(qc_stats),
+            self.group.finalize(qc_stats),
+        )
+    }
+}
+
 impl CandidateAccumulator {
     fn new(level: AggregationLevel, hit: &AlignHit) -> Self {
         let target = hit
@@ -199,7 +251,7 @@ impl CandidateAccumulator {
         }
         debug_assert_eq!(self.accession_or_group, expected_label);
 
-        if self.taxid != target.taxid {
+        if self.taxid != target.taxid && self.level == AggregationLevel::Accession {
             return Err(RvScreenError::validation(
                 "aggregate.taxid",
                 format!(
@@ -207,6 +259,8 @@ impl CandidateAccumulator {
                     self.accession_or_group, self.taxid, target.taxid
                 ),
             ));
+        } else if self.taxid != target.taxid {
+            self.taxid = 0;
         }
 
         if self.level == AggregationLevel::Accession
@@ -293,7 +347,7 @@ impl CandidateAccumulator {
             ));
         }
 
-        if self.taxid != other.taxid {
+        if self.taxid != other.taxid && self.level == AggregationLevel::Accession {
             return Err(RvScreenError::validation(
                 "aggregate.taxid",
                 format!(
@@ -301,6 +355,8 @@ impl CandidateAccumulator {
                     self.accession_or_group, self.taxid, other.taxid
                 ),
             ));
+        } else if self.taxid != other.taxid {
+            self.taxid = 0;
         }
 
         if self.level == AggregationLevel::Accession
@@ -371,10 +427,19 @@ impl CandidateAccumulator {
 
     fn to_call(&self, total_sampled_fragments: u64) -> CandidateCall {
         let mut nonoverlap_fragments = 0u64;
+        let mut coverage_interval_blocks = 0u64;
         let mut covered_bases_total = 0u64;
         for (contig, intervals) in &self.intervals_by_contig {
-            let merged = merge_intervals(intervals.iter().copied());
-            nonoverlap_fragments = nonoverlap_fragments.saturating_add(merged.len() as u64);
+            let non_empty_intervals = intervals
+                .iter()
+                .copied()
+                .filter(|interval| !interval.is_empty())
+                .collect::<Vec<_>>();
+            let merged = merge_intervals(non_empty_intervals.iter().copied());
+            nonoverlap_fragments = nonoverlap_fragments.saturating_add(
+                max_nonoverlapping_intervals(non_empty_intervals.iter().copied()),
+            );
+            coverage_interval_blocks = coverage_interval_blocks.saturating_add(merged.len() as u64);
             covered_bases_total = covered_bases_total.saturating_add(covered_bases(&merged));
             debug_assert!(self.contig_lengths.contains_key(contig));
         }
@@ -390,18 +455,37 @@ impl CandidateAccumulator {
             accession_or_group: self.accession_or_group.clone(),
             accepted_fragments: self.accepted_fragments,
             nonoverlap_fragments,
+            coverage_interval_blocks,
+            nonoverlap_fragments_algorithm: NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
             raw_fraction: stats.raw_fraction,
             unique_fraction: stats.unique_fraction,
+            accepted_fraction_label: "accepted_fragments_per_sampled_fragment".to_string(),
+            unique_fraction_label: "legacy_alias_not_molecule_unique".to_string(),
             fraction_ci_95: stats.fraction_ci_95(),
             clopper_pearson_upper: stats.clopper_pearson_upper,
+            total_sampled_fragments,
+            fraction_denominator_source: "sampled_fragments".to_string(),
             breadth,
             ambiguous_fragments: self.ambiguous_fragments,
             background_ratio: 0.0,
+            aggregation_level: self.level.label().to_string(),
+            multiplicity_family: self.level.label().to_string(),
+            accession_resolution: match self.level {
+                AggregationLevel::Accession => "high".to_string(),
+                AggregationLevel::VirusGroup => "not_applicable".to_string(),
+            },
             decision: DecisionStatus::Indeterminate,
             decision_reasons: vec![
                 format!("aggregation_level={}", self.level.label()),
+                format!("multiplicity_family={}", self.level.label()),
+                format!("coverage_interval_blocks={coverage_interval_blocks}"),
+                format!("nonoverlap_fragments_algorithm={NONOVERLAP_FRAGMENTS_ALGORITHM}"),
+                "accepted_fraction_label=accepted_fragments_per_sampled_fragment".to_string(),
+                "unique_fraction_label=legacy_alias_not_molecule_unique".to_string(),
+                format!("total_sampled_fragments={total_sampled_fragments}"),
+                "fraction_denominator_source=sampled_fragments".to_string(),
                 format!("fraction_ci_95_label={}", stats.ci_label),
-                "background_ratio_pending_task_19".to_string(),
+                "negative_control_policy=not_used_for_default_background_assessment".to_string(),
                 "decision_pending_task_16".to_string(),
             ],
             evidence_strength: evidence_strength(nonoverlap_fragments, breadth),
@@ -421,7 +505,7 @@ impl AggregationLevel {
     fn label(self) -> &'static str {
         match self {
             Self::Accession => "accession",
-            Self::VirusGroup => "virus_group",
+            Self::VirusGroup => "group",
         }
     }
 }

@@ -93,10 +93,10 @@ impl CramFragmentReader {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     self.finished = true;
-                    return self.pending_mate.take().map(|orphan| Err(orphan_cram_record_error(
-                        &self.path,
-                        &orphan,
-                    )));
+                    return self
+                        .pending_mate
+                        .take()
+                        .map(|orphan| Err(orphan_cram_record_error(&self.path, &orphan)));
                 }
                 Err(err) => {
                     self.finished = true;
@@ -249,7 +249,9 @@ fn decode_container_records(
         .map(|record_batches| record_batches.into_iter().flatten().collect())
 }
 
-fn build_reference_sequence_repository(path: &Path) -> Result<(fasta::Repository, BTreeSet<String>)> {
+fn build_reference_sequence_repository(
+    path: &Path,
+) -> Result<(fasta::Repository, BTreeSet<String>)> {
     let fai_path = reference_fai_path(path);
     let index = fasta::fai::fs::read(&fai_path)
         .map_err(|source| map_reference_index_error(path, &fai_path, source))?;
@@ -334,12 +336,7 @@ fn reference_decode_failure_error(
 }
 
 fn orphan_cram_record_error(path: &Path, orphan: &FragmentMateRecord) -> RvScreenError {
-    orphaned_name_sorted_record_error(
-        path,
-        "CRAM",
-        orphan,
-        "provide name-sorted input",
-    )
+    orphaned_name_sorted_record_error(path, "CRAM", orphan, "provide name-sorted input")
 }
 
 #[cfg(test)]
@@ -350,8 +347,8 @@ mod tests {
         fasta::{self, repository::adapters::IndexedReader},
         sam::{
             self,
-            alignment::{RecordBuf, io::Write as _},
-            header::record::value::{Map, map::ReferenceSequence},
+            alignment::{io::Write as _, RecordBuf},
+            header::record::value::{map::ReferenceSequence, Map},
         },
     };
     use std::fs;
@@ -409,12 +406,18 @@ mod tests {
 
         write_test_reference(&reader_reference_path, "chr1", &reference_sequence)
             .expect("reference FASTA and FAI should be written");
-        write_multi_reference(&writer_reference_path, &[("chr1", &reference_sequence), ("chr2", &reference_sequence)])
-            .expect("writer reference FASTA and FAI should be written");
+        write_multi_reference(
+            &writer_reference_path,
+            &[("chr1", &reference_sequence), ("chr2", &reference_sequence)],
+        )
+        .expect("writer reference FASTA and FAI should be written");
         write_test_cram_with_header(
             &cram_path,
             &writer_reference_path,
-            &[("chr1", reference_sequence.len()), ("chr2", reference_sequence.len())],
+            &[
+                ("chr1", reference_sequence.len()),
+                ("chr2", reference_sequence.len()),
+            ],
             &[SyntheticCramRecord::first(
                 "READ:1:FCX123:1:1101:1000:2000",
                 b"ACGT",
@@ -452,13 +455,31 @@ mod tests {
         let mut records = Vec::with_capacity(pair_count * 2);
 
         for pair_index in 0..pair_count {
-            let qname = format!("READ:1:FCX123:1:1101:{}:{}", 1000 + pair_index, 2000 + pair_index);
-            records.push(SyntheticCramRecord::first(&qname, b"ACGT", &[30, 31, 32, 33]));
-            records.push(SyntheticCramRecord::last(&qname, b"TGCA", &[34, 35, 36, 37]));
+            let qname = format!(
+                "READ:1:FCX123:1:1101:{}:{}",
+                1000 + pair_index,
+                2000 + pair_index
+            );
+            records.push(SyntheticCramRecord::first(
+                &qname,
+                b"ACGT",
+                &[30, 31, 32, 33],
+            ));
+            records.push(SyntheticCramRecord::last(
+                &qname,
+                b"TGCA",
+                &[34, 35, 36, 37],
+            ));
         }
 
-        write_test_cram(&cram_path, &reference_path, "chr1", reference_sequence.len(), &records)
-            .expect("CRAM fixture should be written");
+        write_test_cram(
+            &cram_path,
+            &reference_path,
+            "chr1",
+            reference_sequence.len(),
+            &records,
+        )
+        .expect("CRAM fixture should be written");
 
         let mut reader = CramFragmentReader::open(&cram_path, Some(&reference_path))
             .expect("reader should open CRAM with FASTA/FAI");
@@ -628,12 +649,15 @@ mod tests {
             .map(fasta::Repository::new)?;
         let header = header_references
             .iter()
-            .fold(sam::Header::builder(), |builder, (reference_name, reference_len)| {
-                builder.add_reference_sequence(
-                    *reference_name,
-                    Map::<ReferenceSequence>::new(NonZeroUsize::new(*reference_len).unwrap()),
-                )
-            })
+            .fold(
+                sam::Header::builder(),
+                |builder, (reference_name, reference_len)| {
+                    builder.add_reference_sequence(
+                        *reference_name,
+                        Map::<ReferenceSequence>::new(NonZeroUsize::new(*reference_len).unwrap()),
+                    )
+                },
+            )
             .build();
         let file = File::create(path)?;
         let mut writer = cram::io::writer::Builder::default()
