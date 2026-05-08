@@ -1,6 +1,7 @@
+.sisyphus/
+.omx/
 target/
 .local/
-.sisyphus/
 reference_bundle/
 .codex
 .codex/
