@@ -1,18 +1,20 @@
 use crate::calibration::{load_profile, load_reference_bundle};
 use crate::cli::AuditVerifyArgs;
 use crate::decision::{
-    expected_release_status, NegativeControlDecisionInput, NegativeControlResult,
+    expected_release_gate_decision, NegativeControlDecisionInput, NegativeControlResult,
 };
 use crate::error::{Result, RvScreenError};
 use crate::report::contract::{
     sampling_only_ci_label_violation, ReportArtifactKind, CANDIDATE_CALLS_TSV,
     CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV, CANONICAL_CHECKSUM_SHA256,
+    CANONICAL_DETECTION_CALLS_GROUP_TSV, CANONICAL_RELEASE_GATE_JSON,
     CANONICAL_RESULT_OVERVIEW_JSON, CANONICAL_RUN_MANIFEST_JSON, CANONICAL_SAMPLE_RUN_SUMMARY_JSON,
     CANONICAL_SAMPLING_ROUNDS_TSV, CANONICAL_SCHEMA_VERSIONS_JSON, CANONICAL_VIRUS_SUMMARY_TSV,
     CHECKSUM_SHA256, REPORT_ARTIFACT_CONTRACTS, REQUIRED_REPORT_BUNDLE_FILES, ROUNDS_TSV,
     RUN_MANIFEST_JSON, SAMPLE_SUMMARY_JSON,
 };
 use crate::report::summary::VIRUS_SUMMARY_HEADER;
+use crate::report::writer::CANDIDATE_CALLS_HEADER;
 use crate::types::{
     DecisionStatus, NegativeControlStatus, ProfileToml, ReleaseStatus, RoundRecord, RunManifest,
     SampleSummary, StopReason,
@@ -50,6 +52,12 @@ struct CandidateCallTsvRow {
     accession_or_group: String,
     fraction_ci_95: String,
     decision_reasons: String,
+    #[serde(default)]
+    aggregation_level: String,
+    #[serde(default)]
+    accession_resolution: String,
+    #[serde(default)]
+    nonoverlap_fragments_algorithm: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +65,9 @@ struct CandidateCiRecord {
     accession_or_group: String,
     fraction_ci_95: [f64; 2],
     decision_reasons: Vec<String>,
+    aggregation_level: String,
+    accession_resolution: String,
+    nonoverlap_fragments_algorithm: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +148,20 @@ pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
         },
     );
     let rounds = parse_rounds_file(&rounds_path, &mut report);
-    let candidates = parse_candidate_calls_file(&candidate_calls_path, &mut report);
+    let require_v4_candidate_header = candidate_calls_path
+        .strip_prefix(&args.report_bundle)
+        .is_ok_and(|path| path == Path::new(CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV));
+    let candidates = parse_candidate_calls_file(
+        &candidate_calls_path,
+        require_v4_candidate_header,
+        &mut report,
+    );
+    let detection_calls = if layout.has_v2_artifacts {
+        let detection_calls_path = args.report_bundle.join(CANONICAL_DETECTION_CALLS_GROUP_TSV);
+        parse_candidate_calls_file(&detection_calls_path, true, &mut report)
+    } else {
+        None
+    };
 
     verify_canonical_summary_artifacts(
         &args.report_bundle,
@@ -185,10 +209,30 @@ pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
 
     if let Some(candidates) = candidates.as_ref() {
         verify_candidate_ci_labels(candidates, &mut report);
+        verify_accession_resolution_labels(
+            candidates,
+            "candidate_calls.accession.tsv",
+            CandidateScope::Accession,
+            &mut report,
+        );
     } else {
         report.skip(
             "candidate CI labeling",
             "skipped because candidate_calls.tsv did not parse",
+        );
+    }
+
+    if let Some(group_calls) = detection_calls.as_ref() {
+        verify_accession_resolution_labels(
+            group_calls,
+            "detection_calls.group.tsv",
+            CandidateScope::Group,
+            &mut report,
+        );
+    } else if layout.has_v2_artifacts {
+        report.skip(
+            "group detection labeling",
+            "skipped because detection_calls.group.tsv did not parse",
         );
     }
 
@@ -222,6 +266,7 @@ pub fn run_audit_verify(args: &AuditVerifyArgs) -> Result<AuditVerifyReport> {
     };
 
     verify_release_status(
+        &args.report_bundle,
         summary.as_ref(),
         manifest.as_ref(),
         loaded_profile.as_ref(),
@@ -419,9 +464,9 @@ fn verify_schema_versions(
         .collect::<BTreeMap<_, _>>();
 
     let mut mismatches = Vec::new();
-    if schema_versions.report_bundle_schema != "rvscreen.report_bundle.v2" {
+    if schema_versions.report_bundle_schema != "rvscreen.report_bundle.v4" {
         mismatches.push(format!(
-            "report_bundle_schema expected `rvscreen.report_bundle.v2`, observed `{}`",
+            "report_bundle_schema expected `rvscreen.report_bundle.v4`, observed `{}`",
             schema_versions.report_bundle_schema
         ));
     }
@@ -1090,6 +1135,7 @@ fn parse_rounds_file(path: &Path, report: &mut AuditVerifyReport) -> Option<Vec<
 
 fn parse_candidate_calls_file(
     path: &Path,
+    require_v4_header: bool,
     report: &mut AuditVerifyReport,
 ) -> Option<Vec<CandidateCiRecord>> {
     let mut reader = match ReaderBuilder::new().delimiter(b'\t').from_path(path) {
@@ -1102,6 +1148,33 @@ fn parse_candidate_calls_file(
             return None;
         }
     };
+
+    if require_v4_header {
+        let headers = match reader.headers() {
+            Ok(headers) => headers.clone(),
+            Err(error) => {
+                report.fail(
+                    "candidate_calls.tsv",
+                    format!(
+                        "failed to parse TSV header in `{}`: {error}",
+                        path.display()
+                    ),
+                );
+                return None;
+            }
+        };
+        let expected_headers = CANDIDATE_CALLS_HEADER.into_iter().collect::<Vec<_>>();
+        if headers.iter().collect::<Vec<_>>() != expected_headers {
+            report.fail(
+                "candidate_calls.tsv",
+                format!(
+                    "unexpected TSV header in `{}`; expected schema v4 candidate columns",
+                    path.display()
+                ),
+            );
+            return None;
+        }
+    }
 
     let rows = match reader
         .deserialize::<CandidateCallTsvRow>()
@@ -1150,6 +1223,9 @@ fn parse_candidate_calls_file(
             accession_or_group: row.accession_or_group,
             fraction_ci_95,
             decision_reasons,
+            aggregation_level: row.aggregation_level,
+            accession_resolution: row.accession_resolution,
+            nonoverlap_fragments_algorithm: row.nonoverlap_fragments_algorithm,
         });
     }
 
@@ -1233,6 +1309,82 @@ fn verify_internal_bindings(
         );
     } else {
         report.fail("report bundle bindings", mismatches.join("; "));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateScope {
+    Accession,
+    Group,
+}
+
+/// ADR 0002: every candidate row must carry a legal `accession_resolution`
+/// label. Group rows must use `not_applicable` and accession rows must use
+/// one of `high`, `low_resolution`, or `unresolved`.
+fn verify_accession_resolution_labels(
+    candidates: &[CandidateCiRecord],
+    artifact: &'static str,
+    scope: CandidateScope,
+    report: &mut AuditVerifyReport,
+) {
+    let allowed_resolutions: &[&str] = match scope {
+        CandidateScope::Accession => &["high", "low_resolution", "unresolved"],
+        CandidateScope::Group => &["not_applicable"],
+    };
+    let expected_level = match scope {
+        CandidateScope::Accession => "accession",
+        CandidateScope::Group => "group",
+    };
+
+    let mut offenders = Vec::new();
+    let expected_algorithm = crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM;
+    for candidate in candidates {
+        if !candidate.aggregation_level.is_empty()
+            && candidate.aggregation_level != expected_level
+        {
+            offenders.push(format!(
+                "candidate `{}` has aggregation_level `{}`; expected `{}`",
+                candidate.accession_or_group, candidate.aggregation_level, expected_level
+            ));
+            continue;
+        }
+        if candidate.accession_resolution.is_empty() {
+            offenders.push(format!(
+                "candidate `{}` is missing accession_resolution",
+                candidate.accession_or_group
+            ));
+            continue;
+        }
+        if !allowed_resolutions.contains(&candidate.accession_resolution.as_str()) {
+            offenders.push(format!(
+                "candidate `{}` has accession_resolution `{}`; allowed values are {:?}",
+                candidate.accession_or_group,
+                candidate.accession_resolution,
+                allowed_resolutions
+            ));
+        }
+        if !candidate.nonoverlap_fragments_algorithm.is_empty()
+            && candidate.nonoverlap_fragments_algorithm != expected_algorithm
+        {
+            offenders.push(format!(
+                "candidate `{}` declares nonoverlap_fragments_algorithm `{}`; expected `{}`",
+                candidate.accession_or_group,
+                candidate.nonoverlap_fragments_algorithm,
+                expected_algorithm
+            ));
+        }
+    }
+
+    if offenders.is_empty() {
+        report.pass(
+            artifact,
+            format!(
+                "{} candidate row(s) carry valid accession_resolution labels",
+                candidates.len()
+            ),
+        );
+    } else {
+        report.fail(artifact, offenders.join("; "));
     }
 }
 
@@ -1416,6 +1568,7 @@ fn verify_calibration_profile_binding(
 }
 
 fn verify_release_status(
+    report_bundle: &Path,
     summary: Option<&SampleSummary>,
     manifest: Option<&RunManifest>,
     profile: Option<&ProfileToml>,
@@ -1487,19 +1640,30 @@ fn verify_release_status(
     };
 
     let negative_control = negative_control_from_manifest(&manifest.negative_control);
-    let expected = match expected_release_status(
+    let expected_decision = match expected_release_gate_decision(
         &manifest.sampling_mode,
         manifest.negative_control.required,
         &negative_control,
         benchmark_gates.as_ref(),
         &profile.status,
     ) {
-        Ok(status) => status,
+        Ok(decision) => decision,
         Err(error) => {
             report.fail("release_status compliance", error.to_string());
             return;
         }
     };
+
+    let mut expected_decision = expected_decision;
+    if summary.decision_status == DecisionStatus::WeakPositive
+        && expected_decision.status == ReleaseStatus::Final
+    {
+        expected_decision.status = ReleaseStatus::Provisional;
+        expected_decision
+            .secondary_blockers
+            .push("weak_positive_requires_provisional_release".to_string());
+    }
+    let expected = expected_decision.status.clone();
 
     if summary.release_status != expected {
         report.fail(
@@ -1524,6 +1688,51 @@ fn verify_release_status(
                 negative_control_status_label(&manifest.negative_control.status),
                 manifest.negative_control.required,
                 profile.status,
+            ),
+        );
+    }
+
+    verify_release_gate_artifact(report_bundle, &expected_decision, report);
+}
+
+fn verify_release_gate_artifact(
+    report_bundle: &Path,
+    expected_decision: &crate::decision::ReleaseGateDecision,
+    report: &mut AuditVerifyReport,
+) {
+    let path = report_bundle.join(CANONICAL_RELEASE_GATE_JSON);
+    if !path.is_file() {
+        report.skip(
+            "release_gate artifact blockers",
+            "legacy-only bundle; audit/release_gate.json is not required",
+        );
+        return;
+    }
+    let Some(persisted) = parse_json_file::<crate::decision::ReleaseGateDecision>(
+        &path,
+        "audit/release_gate.json",
+        report,
+        |decision| {
+            format!(
+                "parsed release gate status `{}`",
+                release_status_label(&decision.status)
+            )
+        },
+    ) else {
+        return;
+    };
+
+    if persisted == *expected_decision {
+        report.pass(
+            "release_gate artifact blockers",
+            "audit/release_gate.json status and blockers match recomputation",
+        );
+    } else {
+        report.fail(
+            "release_gate artifact blockers",
+            format!(
+                "persisted release gate {:?} does not match recomputed {:?}",
+                persisted, expected_decision
             ),
         );
     }
@@ -1585,6 +1794,7 @@ fn negative_control_status_label(status: &NegativeControlStatus) -> &'static str
 fn decision_status_label(status: &DecisionStatus) -> &'static str {
     match status {
         DecisionStatus::Positive => "positive",
+        DecisionStatus::WeakPositive => "weak_positive",
         DecisionStatus::Negative => "negative",
         DecisionStatus::Indeterminate => "indeterminate",
     }
@@ -1700,6 +1910,56 @@ mod tests {
         assert!(!report.passed(), "audit should fail");
         assert!(
             report.render().contains("candidate TSV mismatch"),
+            "{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn v3_candidate_tsv_missing_required_header_fails_audit() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
+        let canonical_candidate_path = fixture
+            .report_dir
+            .join(CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV);
+        let legacy_candidate_path = fixture.report_dir.join(CANDIDATE_CALLS_TSV);
+        let candidate_content = fs::read_to_string(&canonical_candidate_path)
+            .expect("canonical candidate calls should be readable");
+        let mut lines = candidate_content.lines();
+        let header = lines.next().expect("candidate TSV should have a header");
+        let malformed_header = header
+            .split('\t')
+            .filter(|column| *column != "nonoverlap_fragments_algorithm")
+            .collect::<Vec<_>>()
+            .join("\t");
+        let malformed_rows = lines
+            .map(|line| {
+                line.split('\t')
+                    .enumerate()
+                    .filter_map(|(index, value)| (index != 6).then_some(value))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let malformed_content = format!("{malformed_header}\n{malformed_rows}\n");
+        fs::write(&canonical_candidate_path, &malformed_content)
+            .expect("canonical candidate calls should be rewritten");
+        fs::write(&legacy_candidate_path, malformed_content)
+            .expect("legacy candidate calls should be rewritten");
+
+        let report = run_audit_verify(&AuditVerifyArgs {
+            report_bundle: fixture.report_dir,
+            reference_bundle: Some(fixture.reference_dir),
+            calibration_profile: Some(fixture.profile_dir),
+        })
+        .expect("audit verify should run");
+
+        assert!(!report.passed(), "audit should fail");
+        assert!(
+            report
+                .render()
+                .contains("expected schema v4 candidate columns"),
             "{}",
             report.render()
         );
@@ -1866,6 +2126,7 @@ mod tests {
             &fixture.report_dir,
             &sample_summary_fixture("rvscreen_ref_2026.04.21-r1"),
             &candidate_rows,
+            &[],
             &round_fixtures(),
             &run_manifest_fixture("rvscreen_ref_2026.04.21-r1"),
         )
@@ -1994,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn representative_required_negative_control_missing_is_blocked() {
+    fn representative_required_negative_control_missing_is_allowed_metadata_only() {
         let temp_dir = tempdir().expect("temp dir should be created");
         let fixture = write_audit_fixture(temp_dir.path(), "rvscreen_ref_2026.04.21-r1");
         write_profile_dir_with_mode_and_negative_control(
@@ -2018,12 +2279,9 @@ mod tests {
         })
         .expect("audit verify should run");
 
-        assert!(!report.passed(), "audit should fail");
         assert!(
-            report
-                .render()
-                .contains("does not match recomputed release_status `blocked`"),
-            "{}",
+            report.passed(),
+            "missing negative control is metadata-only by default: {}",
             report.render()
         );
     }
@@ -2068,7 +2326,7 @@ mod tests {
 
     fn checked_report_bundle_vocabulary() -> Vec<String> {
         let schema_versions = serde_json::json!({
-            "report_bundle_schema": "rvscreen.report_bundle.v2",
+            "report_bundle_schema": "rvscreen.report_bundle.v4",
             "canonical_outputs": REPORT_ARTIFACT_CONTRACTS
                 .iter()
                 .map(|contract| (contract.key, contract.canonical_path))
@@ -2226,7 +2484,7 @@ mod tests {
         let rounds = round_fixtures();
         let candidates = candidate_fixtures();
 
-        ReportWriter::write(&report_dir, &summary, &candidates, &rounds, &manifest)
+        ReportWriter::write(&report_dir, &summary, &candidates, &[], &rounds, &manifest)
             .expect("report bundle should be written");
         write_reference_bundle_dir(&reference_dir, reference_version);
         write_profile_dir(&profile_dir, reference_version);
@@ -2295,11 +2553,20 @@ mod tests {
                 min_nonoverlap_fragments: 1,
                 min_breadth: 0.0,
                 max_background_ratio: 0.0,
+                theta_pos_absolute: 3,
+                max_ambiguous_fraction_for_positive: 0.20,
+                min_positive_evidence_strength: EvidenceStrength::High,
+                weak_positive_enabled: true,
             },
             decision_rules: crate::types::DecisionRules {
                 theta_pos: 0.001,
                 theta_neg: 0.0,
                 allow_indeterminate: true,
+                theta_neg_fixed: 0.00001,
+                positive_alpha_global: 0.05,
+                positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+                negative_cp_lod_max: 0.00001,
+                noise_floor_fraction: 0.000001,
             },
         };
         fs::write(
@@ -2381,6 +2648,7 @@ mod tests {
             report_dir,
             &summary,
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &manifest,
         )
@@ -2401,6 +2669,8 @@ mod tests {
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
             release_status: ReleaseStatus::Final,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -2447,6 +2717,16 @@ mod tests {
             accession_or_group: "NC_SYNTHV1.1".to_string(),
             accepted_fragments: 12,
             nonoverlap_fragments: 4,
+            coverage_interval_blocks: 0,
+            nonoverlap_fragments_algorithm:
+                crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+            accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+            unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+            total_sampled_fragments: 0,
+            fraction_denominator_source: "legacy_inferred".into(),
+            aggregation_level: "accession".into(),
+            multiplicity_family: "accession".into(),
+            accession_resolution: "high".into(),
             raw_fraction: 0.00012,
             unique_fraction: 12.0 / 100_000.0,
             fraction_ci_95: [0.00008, 0.00018],
