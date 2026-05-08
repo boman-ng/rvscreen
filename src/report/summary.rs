@@ -7,8 +7,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const SAMPLE_RUN_SUMMARY_SCHEMA_VERSION: &str = "rvscreen.sample_run_summary.v1";
-pub(crate) const RESULT_OVERVIEW_SCHEMA_VERSION: &str = "rvscreen.result_overview.v1";
-pub(crate) const VIRUS_SUMMARY_HEADER: [&str; 22] = [
+pub(crate) const RESULT_OVERVIEW_SCHEMA_VERSION: &str = "rvscreen.result_overview.v2";
+pub(crate) const VIRUS_SUMMARY_HEADER: [&str; 28] = [
     "rank",
     "entity_id",
     "entity_name",
@@ -19,14 +19,20 @@ pub(crate) const VIRUS_SUMMARY_HEADER: [&str; 22] = [
     "evidence_strength",
     "accepted_fragments",
     "nonoverlap_fragments",
+    "coverage_interval_blocks",
+    "nonoverlap_fragments_algorithm",
     "ambiguous_fragments",
     "raw_fraction",
     "unique_fraction",
+    "accepted_fraction_label",
+    "unique_fraction_label",
     "fraction_ci_95_low",
     "fraction_ci_95_high",
     "clopper_pearson_upper",
+    "total_sampled_fragments",
+    "fraction_denominator_source",
     "breadth",
-    "background_ratio",
+    "multiplicity_family",
     "top_accession",
     "top_accession_name",
     "supporting_accession_count",
@@ -39,6 +45,8 @@ pub(crate) struct SampleRunSummary {
     sample_id: String,
     decision_status: String,
     release_status: String,
+    release_primary_blockers: Vec<String>,
+    release_secondary_blockers: Vec<String>,
     stop_reason: String,
     input_fragments: u64,
     qc_passing_fragments: u64,
@@ -47,6 +55,7 @@ pub(crate) struct SampleRunSummary {
     positive_entity_count: usize,
     indeterminate_entity_count: usize,
     negative_entity_count: usize,
+    weak_positive_entity_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -54,7 +63,8 @@ pub(crate) struct ResultOverview {
     schema_version: &'static str,
     sample: ResultOverviewSample,
     run: ResultOverviewRun,
-    top_results: Vec<ResultOverviewTopResult>,
+    top_detections: Vec<ResultOverviewTopResult>,
+    top_accession_evidence: Vec<ResultOverviewTopResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -62,6 +72,8 @@ pub(crate) struct ResultOverviewSample {
     sample_id: String,
     decision_status: String,
     release_status: String,
+    release_primary_blockers: Vec<String>,
+    release_secondary_blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -78,13 +90,12 @@ pub(crate) struct ResultOverviewTopResult {
     rank: usize,
     entity_id: String,
     entity_name: String,
-    aggregation_level: &'static str,
+    aggregation_level: String,
     decision: String,
     evidence_strength: String,
     accepted_fragments: u64,
     unique_fraction: f64,
     breadth: f64,
-    background_ratio: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -94,19 +105,25 @@ pub(crate) struct VirusSummaryRow {
     entity_name: String,
     entity_type: &'static str,
     taxid: u64,
-    aggregation_level: &'static str,
+    aggregation_level: String,
     decision: String,
     evidence_strength: String,
     accepted_fragments: u64,
     nonoverlap_fragments: u64,
+    coverage_interval_blocks: u64,
+    nonoverlap_fragments_algorithm: String,
     ambiguous_fragments: u64,
     raw_fraction: f64,
     unique_fraction: f64,
+    accepted_fraction_label: String,
+    unique_fraction_label: String,
     fraction_ci_95_low: f64,
     fraction_ci_95_high: f64,
     clopper_pearson_upper: f64,
+    total_sampled_fragments: u64,
+    fraction_denominator_source: String,
     breadth: f64,
-    background_ratio: f64,
+    multiplicity_family: String,
     top_accession: String,
     top_accession_name: String,
     supporting_accession_count: u64,
@@ -116,6 +133,7 @@ pub(crate) struct VirusSummaryRow {
 pub(crate) fn sample_run_summary(
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     rounds: &[RoundRecord],
 ) -> Result<SampleRunSummary> {
     Ok(SampleRunSummary {
@@ -123,20 +141,36 @@ pub(crate) fn sample_run_summary(
         sample_id: summary.sample_id.clone(),
         decision_status: enum_label(&summary.decision_status)?,
         release_status: enum_label(&summary.release_status)?,
+        release_primary_blockers: summary.release_primary_blockers.clone(),
+        release_secondary_blockers: summary.release_secondary_blockers.clone(),
         stop_reason: enum_label(&summary.stop_reason)?,
         input_fragments: summary.input_fragments,
         qc_passing_fragments: summary.qc_passing_fragments,
         sampled_fragments: summary.sampled_fragments,
         rounds_run: rounds.len() as u64,
-        positive_entity_count: decision_count(candidates, DecisionStatus::Positive),
-        indeterminate_entity_count: decision_count(candidates, DecisionStatus::Indeterminate),
-        negative_entity_count: decision_count(candidates, DecisionStatus::Negative),
+        positive_entity_count: decision_count(
+            primary_detection_rows(candidates, detection_calls),
+            DecisionStatus::Positive,
+        ),
+        indeterminate_entity_count: decision_count(
+            primary_detection_rows(candidates, detection_calls),
+            DecisionStatus::Indeterminate,
+        ),
+        negative_entity_count: decision_count(
+            primary_detection_rows(candidates, detection_calls),
+            DecisionStatus::Negative,
+        ),
+        weak_positive_entity_count: decision_count(
+            primary_detection_rows(candidates, detection_calls),
+            DecisionStatus::WeakPositive,
+        ),
     })
 }
 
 pub(crate) fn result_overview(
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     manifest: &RunManifest,
 ) -> Result<ResultOverview> {
     Ok(ResultOverview {
@@ -145,6 +179,8 @@ pub(crate) fn result_overview(
             sample_id: summary.sample_id.clone(),
             decision_status: enum_label(&summary.decision_status)?,
             release_status: enum_label(&summary.release_status)?,
+            release_primary_blockers: summary.release_primary_blockers.clone(),
+            release_secondary_blockers: summary.release_secondary_blockers.clone(),
         },
         run: ResultOverviewRun {
             reference_bundle_version: manifest.reference_bundle_version.clone(),
@@ -153,7 +189,11 @@ pub(crate) fn result_overview(
             sampling_mode: manifest.sampling_mode.clone(),
             negative_control_status: enum_label(&manifest.negative_control.status)?,
         },
-        top_results: result_overview_top_results(candidates)?,
+        top_detections: result_overview_top_results(primary_detection_rows(
+            candidates,
+            detection_calls,
+        ))?,
+        top_accession_evidence: result_overview_top_results(candidates)?,
     })
 }
 
@@ -190,10 +230,11 @@ pub(crate) fn virus_summary_rows(candidates: &[CandidateCall]) -> Result<Vec<Vir
 pub(crate) fn serialize_sample_run_summary_json(
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     rounds: &[RoundRecord],
 ) -> Result<Vec<u8>> {
     json_bytes(
-        &sample_run_summary(summary, candidates, rounds)?,
+        &sample_run_summary(summary, candidates, detection_calls, rounds)?,
         "sample_run_summary",
     )
 }
@@ -201,15 +242,19 @@ pub(crate) fn serialize_sample_run_summary_json(
 pub(crate) fn serialize_result_overview_json(
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     manifest: &RunManifest,
 ) -> Result<Vec<u8>> {
     json_bytes(
-        &result_overview(summary, candidates, manifest)?,
+        &result_overview(summary, candidates, detection_calls, manifest)?,
         "result_overview",
     )
 }
 
-pub(crate) fn serialize_virus_summary_tsv(candidates: &[CandidateCall]) -> Result<Vec<u8>> {
+pub(crate) fn serialize_virus_summary_tsv(
+    candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
+) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     {
         let mut writer = WriterBuilder::new()
@@ -223,7 +268,12 @@ pub(crate) fn serialize_virus_summary_tsv(candidates: &[CandidateCall]) -> Resul
             )
         })?;
 
-        for row in virus_summary_rows(candidates)? {
+        let combined = candidates
+            .iter()
+            .cloned()
+            .chain(detection_calls.iter().cloned())
+            .collect::<Vec<_>>();
+        for row in virus_summary_rows(&combined)? {
             writer.serialize(row).map_err(|error| {
                 RvScreenError::validation(
                     "report.virus_summary.tsv",
@@ -239,6 +289,17 @@ pub(crate) fn serialize_virus_summary_tsv(candidates: &[CandidateCall]) -> Resul
     Ok(buffer)
 }
 
+fn primary_detection_rows<'a>(
+    candidates: &'a [CandidateCall],
+    detection_calls: &'a [CandidateCall],
+) -> &'a [CandidateCall] {
+    if detection_calls.is_empty() {
+        candidates
+    } else {
+        detection_calls
+    }
+}
+
 fn result_overview_top_results(
     candidates: &[CandidateCall],
 ) -> Result<Vec<ResultOverviewTopResult>> {
@@ -250,13 +311,12 @@ fn result_overview_top_results(
                 rank: index + 1,
                 entity_id: candidate.accession_or_group.clone(),
                 entity_name: candidate.virus_name.clone(),
-                aggregation_level: "accession",
+                aggregation_level: candidate.aggregation_level.clone(),
                 decision: enum_label(&candidate.decision)?,
                 evidence_strength: enum_label(&candidate.evidence_strength)?,
                 accepted_fragments: candidate.accepted_fragments,
                 unique_fraction: candidate.unique_fraction,
                 breadth: candidate.breadth,
-                background_ratio: candidate.background_ratio,
             })
         })
         .collect()
@@ -277,7 +337,7 @@ enum SummaryAggregationLevel {
 impl SummaryAggregationLevel {
     fn from_label(label: &str) -> Self {
         match label {
-            "virus_group" => Self::VirusGroup,
+            "group" => Self::VirusGroup,
             _ => Self::Accession,
         }
     }
@@ -285,7 +345,7 @@ impl SummaryAggregationLevel {
     fn label(self) -> &'static str {
         match self {
             Self::Accession => "accession",
-            Self::VirusGroup => "virus_group",
+            Self::VirusGroup => "group",
         }
     }
 
@@ -368,7 +428,7 @@ impl VirusSummaryAccumulator {
             SummaryAggregationLevel::VirusGroup => metadata
                 .supporting_accession
                 .clone()
-                .unwrap_or_else(|| "<missing-supporting-accession>".to_owned()),
+                .unwrap_or_else(|| candidate.accession_or_group.clone()),
         };
         let candidate_support_row = CandidateSupportRow {
             candidate,
@@ -419,7 +479,7 @@ impl VirusSummaryAccumulator {
             entity_name: representative.virus_name.clone(),
             entity_type: self.aggregation_level.entity_type(),
             taxid: representative.taxid,
-            aggregation_level: self.aggregation_level.label(),
+            aggregation_level: self.aggregation_level.label().to_string(),
             decision: enum_label(&representative.decision)?,
             evidence_strength: enum_label(&representative.evidence_strength)?,
             accepted_fragments: selected_rows
@@ -430,6 +490,11 @@ impl VirusSummaryAccumulator {
                 .iter()
                 .map(|row| row.candidate.nonoverlap_fragments)
                 .sum(),
+            coverage_interval_blocks: selected_rows
+                .iter()
+                .map(|row| row.candidate.coverage_interval_blocks)
+                .sum(),
+            nonoverlap_fragments_algorithm: representative.nonoverlap_fragments_algorithm.clone(),
             ambiguous_fragments: selected_rows
                 .iter()
                 .map(|row| row.candidate.ambiguous_fragments)
@@ -442,6 +507,8 @@ impl VirusSummaryAccumulator {
                 .iter()
                 .map(|row| row.candidate.unique_fraction)
                 .sum(),
+            accepted_fraction_label: representative.accepted_fraction_label.clone(),
+            unique_fraction_label: representative.unique_fraction_label.clone(),
             fraction_ci_95_low: selected_rows
                 .iter()
                 .map(|row| row.candidate.fraction_ci_95[0])
@@ -454,14 +521,17 @@ impl VirusSummaryAccumulator {
                 .iter()
                 .map(|row| row.candidate.clopper_pearson_upper)
                 .fold(0.0, f64::max),
+            total_sampled_fragments: selected_rows
+                .iter()
+                .map(|row| row.candidate.total_sampled_fragments)
+                .max()
+                .unwrap_or(0),
+            fraction_denominator_source: representative.fraction_denominator_source.clone(),
             breadth: selected_rows
                 .iter()
                 .map(|row| row.candidate.breadth)
                 .fold(0.0, f64::max),
-            background_ratio: selected_rows
-                .iter()
-                .map(|row| row.candidate.background_ratio)
-                .fold(0.0, f64::max),
+            multiplicity_family: representative.multiplicity_family.clone(),
             top_accession,
             top_accession_name,
             supporting_accession_count: match self.aggregation_level {
@@ -524,7 +594,8 @@ fn compare_candidate_strength(left: &CandidateCall, right: &CandidateCall) -> st
 
 fn row_decision_rank(decision: &str) -> u8 {
     match decision {
-        "positive" => 3,
+        "positive" => 4,
+        "weak_positive" => 3,
         "indeterminate" => 2,
         "negative" => 1,
         _ => 0,
@@ -533,9 +604,10 @@ fn row_decision_rank(decision: &str) -> u8 {
 
 fn row_evidence_rank(evidence_strength: &str) -> u8 {
     match evidence_strength {
-        "high" => 3,
-        "medium" => 2,
-        "low" => 1,
+        "high" => 4,
+        "moderate" | "medium" => 3,
+        "low" => 2,
+        "insufficient" => 1,
         _ => 0,
     }
 }
@@ -549,7 +621,8 @@ fn decision_count(candidates: &[CandidateCall], decision: DecisionStatus) -> usi
 
 fn decision_rank(decision: &DecisionStatus) -> u8 {
     match decision {
-        DecisionStatus::Positive => 3,
+        DecisionStatus::Positive => 4,
+        DecisionStatus::WeakPositive => 3,
         DecisionStatus::Indeterminate => 2,
         DecisionStatus::Negative => 1,
     }
@@ -557,9 +630,10 @@ fn decision_rank(decision: &DecisionStatus) -> u8 {
 
 fn evidence_rank(evidence_strength: &EvidenceStrength) -> u8 {
     match evidence_strength {
-        EvidenceStrength::High => 3,
-        EvidenceStrength::Medium => 2,
-        EvidenceStrength::Low => 1,
+        EvidenceStrength::High => 4,
+        EvidenceStrength::Moderate | EvidenceStrength::Medium => 3,
+        EvidenceStrength::Low => 2,
+        EvidenceStrength::Insufficient => 1,
     }
 }
 
@@ -599,6 +673,7 @@ mod tests {
         let bytes = serialize_sample_run_summary_json(
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
         )
         .expect("sample run summary should serialize");
@@ -610,6 +685,8 @@ mod tests {
   "sample_id": "S001",
   "decision_status": "positive",
   "release_status": "final",
+  "release_primary_blockers": [],
+  "release_secondary_blockers": [],
   "stop_reason": "positive_boundary_crossed",
   "input_fragments": 24837219,
   "qc_passing_fragments": 24100988,
@@ -617,7 +694,8 @@ mod tests {
   "rounds_run": 4,
   "positive_entity_count": 2,
   "indeterminate_entity_count": 1,
-  "negative_entity_count": 1
+  "negative_entity_count": 1,
+  "weak_positive_entity_count": 0
 }"#
         );
     }
@@ -625,7 +703,7 @@ mod tests {
     #[test]
     fn result_overview_json_has_exact_top_level_fields_and_empty_defaults() {
         let sample_summary_bytes =
-            serialize_sample_run_summary_json(&empty_sample_summary_fixture(), &[], &[])
+            serialize_sample_run_summary_json(&empty_sample_summary_fixture(), &[], &[], &[])
                 .expect("empty sample run summary should serialize");
         assert_eq!(
             String::from_utf8(sample_summary_bytes).expect("summary JSON should be UTF-8"),
@@ -634,6 +712,8 @@ mod tests {
   "sample_id": "S-empty",
   "decision_status": "negative",
   "release_status": "provisional",
+  "release_primary_blockers": [],
+  "release_secondary_blockers": [],
   "stop_reason": "negative_boundary_confirmed",
   "input_fragments": 0,
   "qc_passing_fragments": 0,
@@ -641,12 +721,14 @@ mod tests {
   "rounds_run": 0,
   "positive_entity_count": 0,
   "indeterminate_entity_count": 0,
-  "negative_entity_count": 0
+  "negative_entity_count": 0,
+  "weak_positive_entity_count": 0
 }"#
         );
 
         let bytes = serialize_result_overview_json(
             &empty_sample_summary_fixture(),
+            &[],
             &[],
             &run_manifest_fixture(),
         )
@@ -655,11 +737,13 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes).expect("result overview JSON should be UTF-8"),
             r#"{
-  "schema_version": "rvscreen.result_overview.v1",
+  "schema_version": "rvscreen.result_overview.v2",
   "sample": {
     "sample_id": "S-empty",
     "decision_status": "negative",
-    "release_status": "provisional"
+    "release_status": "provisional",
+    "release_primary_blockers": [],
+    "release_secondary_blockers": []
   },
   "run": {
     "reference_bundle_version": "rvscreen_ref_2026.04.20-r1",
@@ -668,29 +752,33 @@ mod tests {
     "sampling_mode": "representative",
     "negative_control_status": "pass"
   },
-  "top_results": []
+  "top_detections": [],
+  "top_accession_evidence": []
 }"#
         );
     }
 
     #[test]
     fn virus_summary_tsv_has_exact_header_and_empty_behavior() {
-        let bytes = serialize_virus_summary_tsv(&[]).expect("empty virus summary should serialize");
+        let bytes =
+            serialize_virus_summary_tsv(&[], &[]).expect("empty virus summary should serialize");
         assert_eq!(
             String::from_utf8(bytes).expect("virus summary TSV should be UTF-8"),
             concat!(
                 "rank\tentity_id\tentity_name\tentity_type\ttaxid\taggregation_level\tdecision\t",
-                "evidence_strength\taccepted_fragments\tnonoverlap_fragments\tambiguous_fragments\t",
-                "raw_fraction\tunique_fraction\tfraction_ci_95_low\tfraction_ci_95_high\t",
-                "clopper_pearson_upper\tbreadth\tbackground_ratio\ttop_accession\t",
-                "top_accession_name\tsupporting_accession_count\tdecision_reasons\n"
+                "evidence_strength\taccepted_fragments\tnonoverlap_fragments\tcoverage_interval_blocks\t",
+                "nonoverlap_fragments_algorithm\tambiguous_fragments\traw_fraction\tunique_fraction\t",
+                "accepted_fraction_label\tunique_fraction_label\tfraction_ci_95_low\tfraction_ci_95_high\t",
+                "clopper_pearson_upper\ttotal_sampled_fragments\tfraction_denominator_source\tbreadth\t",
+                "multiplicity_family\ttop_accession\ttop_accession_name\tsupporting_accession_count\t",
+                "decision_reasons\n"
             )
         );
     }
 
     #[test]
     fn virus_summary_rows_use_phase_one_defaults_and_sort_order() {
-        let bytes = serialize_virus_summary_tsv(&candidate_fixtures())
+        let bytes = serialize_virus_summary_tsv(&candidate_fixtures(), &[])
             .expect("virus summary should serialize");
         let mut reader = ReaderBuilder::new()
             .delimiter(b'\t')
@@ -720,19 +808,19 @@ mod tests {
         assert_eq!(first.get(0), Some("1"));
         assert_eq!(first.get(3), Some("accession"));
         assert_eq!(first.get(5), Some("accession"));
-        assert_eq!(first.get(13), Some("0.00003"));
-        assert_eq!(first.get(14), Some("0.00008"));
-        assert_eq!(first.get(18), Some("positive-high-a"));
-        assert_eq!(first.get(19), Some("Positive high A"));
-        assert_eq!(first.get(20), Some("1"));
+        assert_eq!(first.get(17), Some("0.00003"));
+        assert_eq!(first.get(18), Some("0.00008"));
+        assert_eq!(first.get(24), Some("positive-high-a"));
+        assert_eq!(first.get(25), Some("Positive high A"));
+        assert_eq!(first.get(26), Some("1"));
         assert_eq!(
-            first.get(21),
+            first.get(27),
             Some(r#"["unique_fraction_above_theta_pos"]"#)
         );
     }
 
     #[test]
-    fn virus_summary_aggregates_multiple_accessions_for_same_virus_group() {
+    fn virus_summary_aggregates_multiple_accessions_for_same_group() {
         let rows = virus_summary_rows(&[
             group_candidate_fixture(GroupCandidateFixtureSpec {
                 group: "herpesviridae",
@@ -765,8 +853,8 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.entity_id, "herpesviridae");
         assert_eq!(row.entity_name, "Herpesviridae");
-        assert_eq!(row.entity_type, "virus_group");
-        assert_eq!(row.aggregation_level, "virus_group");
+        assert_eq!(row.entity_type, "group");
+        assert_eq!(row.aggregation_level, "group");
         assert_eq!(row.accepted_fragments, 11);
         assert_eq!(row.nonoverlap_fragments, 5);
         assert_eq!(row.ambiguous_fragments, 3);
@@ -776,7 +864,7 @@ mod tests {
         assert_decision_reasons(
             &row.decision_reasons,
             &[
-                "aggregation_level=virus_group",
+                "aggregation_level=group",
                 "support_source=ebv",
                 "support_source=hsv1",
                 "supporting_accession=NC_001806",
@@ -868,7 +956,7 @@ mod tests {
         assert_decision_reasons(
             &row.decision_reasons,
             &[
-                "aggregation_level=virus_group",
+                "aggregation_level=group",
                 "support_rank=duplicate_lower_score",
                 "support_rank=strongest",
                 "supporting_accession=NC_adeno_A",
@@ -896,15 +984,15 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.entity_type, "virus_group");
-        assert_eq!(row.aggregation_level, "virus_group");
+        assert_eq!(row.entity_type, "group");
+        assert_eq!(row.aggregation_level, "group");
         assert_eq!(row.top_accession, "");
         assert_eq!(row.top_accession_name, "");
         assert_eq!(row.supporting_accession_count, 0);
         assert_decision_reasons(
             &row.decision_reasons,
             &[
-                "aggregation_level=virus_group",
+                "aggregation_level=group",
                 "supporting_accession_unavailable=true",
             ],
         );
@@ -955,7 +1043,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.entity_id, "segmented-virus-set");
-        assert_eq!(row.aggregation_level, "virus_group");
+        assert_eq!(row.aggregation_level, "group");
         assert_eq!(row.accepted_fragments, 9);
         assert_eq!(row.nonoverlap_fragments, 5);
         assert_eq!(row.ambiguous_fragments, 3);
@@ -966,7 +1054,7 @@ mod tests {
         assert_decision_reasons(
             &row.decision_reasons,
             &[
-                "aggregation_level=virus_group",
+                "aggregation_level=group",
                 "segment=L",
                 "segment=L_duplicate_lower_support",
                 "segment=S",
@@ -998,6 +1086,16 @@ mod tests {
                 accession_or_group: "NC_borderline.1".into(),
                 accepted_fragments: 2,
                 nonoverlap_fragments: 1,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 0.00002,
                 unique_fraction: 0.00001,
                 fraction_ci_95: [0.0, 0.00004],
@@ -1018,6 +1116,16 @@ mod tests {
                 accession_or_group: "NC_control_like.1".into(),
                 accepted_fragments: 3,
                 nonoverlap_fragments: 1,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 0.00003,
                 unique_fraction: 0.00001,
                 fraction_ci_95: [0.0, 0.00006],
@@ -1034,8 +1142,13 @@ mod tests {
             },
         ];
 
-        let summary = sample_run_summary(&sample_summary_fixture(), &candidates, &round_fixtures())
-            .expect("sample run summary should derive counts");
+        let summary = sample_run_summary(
+            &sample_summary_fixture(),
+            &candidates,
+            &[],
+            &round_fixtures(),
+        )
+        .expect("sample run summary should derive counts");
         assert_eq!(summary.positive_entity_count, 1);
         assert_eq!(summary.indeterminate_entity_count, 1);
         assert_eq!(summary.negative_entity_count, 1);
@@ -1043,12 +1156,22 @@ mod tests {
         let overview = result_overview(
             &sample_summary_fixture(),
             &candidates,
+            &[],
             &run_manifest_fixture(),
         )
         .expect("result overview should serialize edge cases");
-        assert_eq!(overview.top_results[0].entity_id, "NC_single_hit.1");
-        assert_eq!(overview.top_results[1].entity_id, "NC_borderline.1");
-        assert_eq!(overview.top_results[2].entity_id, "NC_control_like.1");
+        assert_eq!(
+            overview.top_accession_evidence[0].entity_id,
+            "NC_single_hit.1"
+        );
+        assert_eq!(
+            overview.top_accession_evidence[1].entity_id,
+            "NC_borderline.1"
+        );
+        assert_eq!(
+            overview.top_accession_evidence[2].entity_id,
+            "NC_control_like.1"
+        );
 
         let rows = virus_summary_rows(&candidates).expect("virus summary rows should serialize");
         let borderline = rows
@@ -1080,13 +1203,14 @@ mod tests {
         let bytes = serialize_result_overview_json(
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &run_manifest_fixture(),
         )
         .expect("result overview should serialize");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON should parse");
-        let top_results = value["top_results"]
+        let top_results = value["top_accession_evidence"]
             .as_array()
-            .expect("top_results should be an array");
+            .expect("top_accession_evidence should be an array");
 
         let ids = top_results
             .iter()
@@ -1117,20 +1241,21 @@ mod tests {
         let manifest = run_manifest_fixture();
 
         assert_eq!(
-            serialize_sample_run_summary_json(&summary, &candidates, &rounds)
+            serialize_sample_run_summary_json(&summary, &candidates, &[], &rounds)
                 .expect("first sample run summary should serialize"),
-            serialize_sample_run_summary_json(&summary, &candidates, &rounds)
+            serialize_sample_run_summary_json(&summary, &candidates, &[], &rounds)
                 .expect("second sample run summary should serialize")
         );
         assert_eq!(
-            serialize_result_overview_json(&summary, &candidates, &manifest)
+            serialize_result_overview_json(&summary, &candidates, &[], &manifest)
                 .expect("first result overview should serialize"),
-            serialize_result_overview_json(&summary, &candidates, &manifest)
+            serialize_result_overview_json(&summary, &candidates, &[], &manifest)
                 .expect("second result overview should serialize")
         );
         assert_eq!(
-            serialize_virus_summary_tsv(&candidates).expect("first virus summary should serialize"),
-            serialize_virus_summary_tsv(&candidates)
+            serialize_virus_summary_tsv(&candidates, &[])
+                .expect("first virus summary should serialize"),
+            serialize_virus_summary_tsv(&candidates, &[])
                 .expect("second virus summary should serialize")
         );
     }
@@ -1149,6 +1274,8 @@ mod tests {
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
             release_status: ReleaseStatus::Final,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -1166,6 +1293,8 @@ mod tests {
             stop_reason: StopReason::NegativeBoundaryConfirmed,
             decision_status: DecisionStatus::Negative,
             release_status: ReleaseStatus::Provisional,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -1282,7 +1411,7 @@ mod tests {
     }
 
     fn group_candidate_fixture(spec: GroupCandidateFixtureSpec) -> CandidateCall {
-        let mut decision_reasons = vec!["aggregation_level=virus_group".to_string()];
+        let mut decision_reasons = vec!["aggregation_level=group".to_string()];
         if let Some(supporting_accession) = spec.supporting_accession {
             decision_reasons.push(format!("supporting_accession={supporting_accession}"));
         }
@@ -1299,6 +1428,16 @@ mod tests {
             accession_or_group: spec.group.into(),
             accepted_fragments: spec.accepted_fragments,
             nonoverlap_fragments: spec.nonoverlap_fragments,
+            coverage_interval_blocks: 0,
+            nonoverlap_fragments_algorithm:
+                crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+            accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+            unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+            total_sampled_fragments: 0,
+            fraction_denominator_source: "legacy_inferred".into(),
+            aggregation_level: "accession".into(),
+            multiplicity_family: "accession".into(),
+            accession_resolution: "high".into(),
             raw_fraction: spec.unique_fraction + 0.01,
             unique_fraction: spec.unique_fraction,
             fraction_ci_95: [0.00003, 0.00008],
@@ -1325,6 +1464,16 @@ mod tests {
             accession_or_group: spec.accession.into(),
             accepted_fragments: spec.accepted_fragments,
             nonoverlap_fragments: spec.accepted_fragments / 2,
+            coverage_interval_blocks: 0,
+            nonoverlap_fragments_algorithm:
+                crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+            accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+            unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+            total_sampled_fragments: 0,
+            fraction_denominator_source: "legacy_inferred".into(),
+            aggregation_level: "accession".into(),
+            multiplicity_family: "accession".into(),
+            accession_resolution: "high".into(),
             raw_fraction: spec.unique_fraction + 0.01,
             unique_fraction: spec.unique_fraction,
             fraction_ci_95: [0.00003, 0.00008],

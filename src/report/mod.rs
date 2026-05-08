@@ -12,8 +12,16 @@ pub fn write_report_bundle(
     output_dir: impl AsRef<Path>,
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     rounds: &[RoundRecord],
     manifest: &RunManifest,
 ) -> Result<()> {
-    ReportWriter::write(output_dir, summary, candidates, rounds, manifest)
+    ReportWriter::write(
+        output_dir,
+        summary,
+        candidates,
+        detection_calls,
+        rounds,
+        manifest,
+    )
 }
