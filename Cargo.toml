@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Rapid, conservative, auditable viral signal detection in human sequencing data"
 license = "MIT"
+default-run = "rvscreen"
 
 [[bin]]
 name = "rvscreen"
