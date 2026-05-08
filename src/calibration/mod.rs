@@ -3,8 +3,8 @@ use crate::error::{Result, RvScreenError};
 use crate::pipeline::run_screen;
 use crate::sampling::DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS;
 use crate::types::{
-    BundleToml, CandidateRules, DecisionRules, DecisionStatus, FragmentRules, ProfileToml,
-    ReleaseStatus, SamplingConfig, SamplingRoundMode,
+    BundleToml, CandidateRules, DecisionRules, DecisionStatus, EvidenceStrength, FragmentRules,
+    ProfileToml, ReleaseStatus, SamplingConfig, SamplingRoundMode,
 };
 use csv::WriterBuilder;
 use serde::{Deserialize, Serialize};
@@ -502,7 +502,10 @@ fn run_benchmark_dataset(
             outcome.summary.decision_status != DecisionStatus::Positive
         }
         BenchmarkExpectedOutcome::SpikeIn => {
-            outcome.summary.decision_status == DecisionStatus::Positive && detected_expected_target
+            matches!(
+                outcome.summary.decision_status,
+                DecisionStatus::Positive | DecisionStatus::WeakPositive
+            ) && detected_expected_target
         }
     };
 
@@ -755,6 +758,10 @@ fn default_candidate_rules() -> CandidateRules {
         min_nonoverlap_fragments: 3,
         min_breadth: 0.001,
         max_background_ratio: 1.5,
+        theta_pos_absolute: 1,
+        max_ambiguous_fraction_for_positive: 0.20,
+        min_positive_evidence_strength: EvidenceStrength::Moderate,
+        weak_positive_enabled: true,
     }
 }
 
@@ -763,6 +770,11 @@ fn default_decision_rules() -> DecisionRules {
         theta_pos: 0.00005,
         theta_neg: 0.000005,
         allow_indeterminate: true,
+        theta_neg_fixed: 0.00001,
+        positive_alpha_global: 0.05,
+        positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+        negative_cp_lod_max: 0.00001,
+        noise_floor_fraction: 0.000001,
     }
 }
 

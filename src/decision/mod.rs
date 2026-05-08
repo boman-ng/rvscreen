@@ -9,6 +9,7 @@ pub use negative_control::{
     NegativeControlResult,
 };
 pub use release_gate::{
-    expected_release_status, load_benchmark_gates, ReleaseContext, ReleaseGate,
+    expected_release_gate_decision, expected_release_status, load_benchmark_gates, ReleaseContext,
+    ReleaseGate, ReleaseGateDecision,
 };
 pub use stats::{ProportionEstimate, SAMPLING_ONLY_CI_LABEL};
