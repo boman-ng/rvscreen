@@ -1,6 +1,6 @@
 use super::spool::{RepresentativeBatchDelta, RepresentativeRoundSpool};
 use crate::adjudicate::{AdjudicationInputs, FragmentAdjudicator};
-use crate::aggregate::CandidateAggregator;
+use crate::aggregate::CandidateAggregationPair;
 use crate::align::{CompetitiveAligner, FragmentAlignResult};
 use crate::error::{Result, RvScreenError};
 use crate::io::FragmentRecord as IoFragmentRecord;
@@ -77,7 +77,7 @@ where
 }
 
 pub(crate) struct RoundExecutor<'scope> {
-    inner: OrderedExecutor<'scope, IoFragmentRecord, ProcessedFragment, CandidateAggregator>,
+    inner: OrderedExecutor<'scope, IoFragmentRecord, ProcessedFragment, CandidateAggregationPair>,
 }
 
 pub(crate) struct RepresentativeRoundExecutor<'scope> {
@@ -126,7 +126,7 @@ impl RoundParallelism {
             work_capacity,
             result_capacity,
             move |fragment| process_fragment(fragment, aligner, adjudicator),
-            CandidateAggregator::new(),
+            CandidateAggregationPair::new(),
             |aggregator, processed| {
                 aggregator.add_fragment(processed.class, &processed.align_result)
             },
@@ -164,7 +164,7 @@ impl<'scope> RoundExecutor<'scope> {
         self.inner.submit(sequence, fragment)
     }
 
-    pub(crate) fn finish(self) -> Result<CandidateAggregator> {
+    pub(crate) fn finish(self) -> Result<CandidateAggregationPair> {
         self.inner.finish()
     }
 }

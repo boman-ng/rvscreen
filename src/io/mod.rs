@@ -1,7 +1,7 @@
 pub mod bam;
+mod contract;
 pub mod cram;
 pub mod fastq;
-mod contract;
 mod fragment_reader;
 mod input;
 

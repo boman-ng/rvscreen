@@ -210,12 +210,7 @@ fn build_fragment_record(
 }
 
 fn orphan_bam_record_error(path: &Path, orphan: &FragmentMateRecord) -> RvScreenError {
-    orphaned_name_sorted_record_error(
-        path,
-        "BAM",
-        orphan,
-        "provide name-sorted BAM/uBAM input",
-    )
+    orphaned_name_sorted_record_error(path, "BAM", orphan, "provide name-sorted BAM/uBAM input")
 }
 
 #[cfg(test)]
@@ -352,9 +347,21 @@ mod tests {
             &bam_path,
             "queryname",
             &[
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"ACGT", &[30, 31, 32, 33]),
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"TGCA", &[34, 35, 36, 37]),
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1001:2001", b"GGTT", &[20, 21, 22, 23]),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"ACGT",
+                    &[30, 31, 32, 33],
+                ),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"TGCA",
+                    &[34, 35, 36, 37],
+                ),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1001:2001",
+                    b"GGTT",
+                    &[20, 21, 22, 23],
+                ),
             ],
         )
         .expect("BAM fixture should be written");
@@ -393,10 +400,26 @@ mod tests {
             &bam_path,
             "queryname",
             &[
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"ACGT", &[30, 31, 32, 33]),
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1000:2000", b"TGCA", &[34, 35, 36, 37]),
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1001:2001", b"GGTT", &[20, 21, 22, 23]),
-                SyntheticBamRecord::new("READ:1:FCX123:1:1101:1002:2002", b"AACC", &[24, 25, 26, 27]),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"ACGT",
+                    &[30, 31, 32, 33],
+                ),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1000:2000",
+                    b"TGCA",
+                    &[34, 35, 36, 37],
+                ),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1001:2001",
+                    b"GGTT",
+                    &[20, 21, 22, 23],
+                ),
+                SyntheticBamRecord::new(
+                    "READ:1:FCX123:1:1101:1002:2002",
+                    b"AACC",
+                    &[24, 25, 26, 27],
+                ),
             ],
         )
         .expect("BAM fixture should be written");
