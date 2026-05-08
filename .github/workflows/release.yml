@@ -84,6 +84,25 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace
 
+      - name: Generate report bundle audit fixture
+        shell: bash
+        run: |
+          echo "RVSCREEN_AUDIT_FIXTURE=${RUNNER_TEMP}/rvscreen-release-audit-fixture" >> "${GITHUB_ENV}"
+          bash scripts/generate_ci_audit_fixture.sh "${RUNNER_TEMP}/rvscreen-release-audit-fixture"
+
+      - name: Verify generated report bundle audit
+        shell: bash
+        run: |
+          cargo run --locked -- audit verify --report-bundle "${RVSCREEN_AUDIT_FIXTURE}/report-bundle" --reference-bundle "${RVSCREEN_AUDIT_FIXTURE}/reference-bundle" --calibration-profile "${RVSCREEN_AUDIT_FIXTURE}/calibration-profile"
+
+      - name: Upload generated audit fixture on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvscreen-release-generated-audit-fixture
+          path: ${{ env.RVSCREEN_AUDIT_FIXTURE }}
+          if-no-files-found: warn
+
       - name: Build release binary
         run: cargo build --locked --release --bin rvscreen
 

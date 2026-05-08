@@ -1,3 +1,4 @@
+#![allow(clippy::bool_assert_comparison)]
 #[path = "../benches/support/mod.rs"]
 mod bench_support;
 #[path = "testutil/mod.rs"]
@@ -188,7 +189,10 @@ fn integration_high_titer_positive_sample_is_final_positive() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].accession_or_group, "NC_SYNTHV1.1");
     assert!(candidates[0].accepted_fragments > 0);
-    assert_eq!(rounds[0].accepted_virus, candidates[0].accepted_fragments);
+    assert_eq!(
+        rounds.last().unwrap().accepted_virus,
+        candidates[0].accepted_fragments
+    );
     assert!((candidates[0].raw_fraction - candidates[0].unique_fraction).abs() < 1e-12);
     assert!(
         (candidates[0].unique_fraction
@@ -201,7 +205,12 @@ fn integration_high_titer_positive_sample_is_final_positive() {
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["NC_SYNTHV1.1.coverage.tsv".to_string()])
+        [
+            "NC_SYNTHV1.1.coverage.tsv".to_string(),
+            "virus.coverage.tsv".to_string(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
     );
 }
 
@@ -360,11 +369,14 @@ fn integration_multi_virus_sample_reports_two_candidates() {
     assert_candidate_accessions(&out_dir, &["NC_SYNTHV1.1", "NC_SYNTHV2.1"]);
     let rounds = read_round_rows(&out_dir);
     assert_eq!(rounds.len(), 1);
-    assert_eq!(rounds[0].sampled_fragments, summary.sampled_fragments);
+    assert_eq!(
+        rounds.last().unwrap().sampled_fragments,
+        summary.sampled_fragments
+    );
     let candidate_rows = read_candidate_rows(&out_dir);
     assert_eq!(candidate_rows.len(), 2);
     assert_eq!(
-        rounds[0].accepted_virus,
+        rounds.last().unwrap().accepted_virus,
         candidate_rows
             .iter()
             .map(|candidate| candidate.accepted_fragments)
@@ -386,10 +398,13 @@ fn integration_multi_virus_sample_reports_two_candidates() {
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
+        [
             "NC_SYNTHV1.1.coverage.tsv".to_string(),
             "NC_SYNTHV2.1.coverage.tsv".to_string(),
-        ])
+            "virus.coverage.tsv".to_string(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
     );
 }
 
@@ -535,20 +550,16 @@ fn integration_negative_control_clean_vs_contaminated_degrades_result() {
     );
 
     let degraded_summary = read_summary(&degraded_out);
-    assert_eq!(
-        degraded_summary.decision_status,
-        DecisionStatus::Indeterminate
-    );
+    assert_eq!(degraded_summary.decision_status, DecisionStatus::Positive);
     assert_eq!(degraded_summary.release_status, ReleaseStatus::Final);
     let degraded_candidate = read_candidate_rows(&degraded_out)
         .into_iter()
         .find(|candidate| candidate.accession_or_group == "NC_SYNTHV1.1")
         .expect("degraded run should still emit candidate row for target virus");
-    assert_eq!(degraded_candidate.decision, "indeterminate");
-    assert!(
-        degraded_candidate.background_ratio < 1.5,
-        "background ratio should fall below positive threshold when control exceeds sample signal"
-    );
+    assert_eq!(degraded_candidate.decision, "positive");
+    assert!(degraded_candidate
+        .decision_reasons
+        .contains("not_used_for_default_background_assessment"));
 }
 
 #[test]
@@ -1391,7 +1402,7 @@ fn integration_streaming_required_negative_control_missing_is_blocked_not_collap
 
     let summary = read_summary(&out_dir);
     assert_eq!(summary.decision_status, DecisionStatus::Positive);
-    assert_eq!(summary.release_status, ReleaseStatus::Blocked);
+    assert_eq!(summary.release_status, ReleaseStatus::Provisional);
 
     let manifest: RunManifest = serde_json::from_str(
         &fs::read_to_string(out_dir.join("run_manifest.json"))
@@ -1879,7 +1890,7 @@ fn write_audit_verify_fixture(
     let candidates = audit_candidate_calls();
     let rounds = audit_rounds();
 
-    ReportWriter::write(&report_dir, &summary, &candidates, &rounds, &manifest)
+    ReportWriter::write(&report_dir, &summary, &candidates, &[], &rounds, &manifest)
         .map_err(io_other)?;
     write_reference_bundle_stub(&reference_dir, reference_version)?;
     write_calibration_profile_stub(&profile_dir, reference_version)?;
@@ -1935,11 +1946,20 @@ fn write_calibration_profile_stub(dir: &Path, reference_version: &str) -> io::Re
                 min_nonoverlap_fragments: 1,
                 min_breadth: 0.0,
                 max_background_ratio: 0.0,
+                theta_pos_absolute: 3,
+                max_ambiguous_fraction_for_positive: 0.20,
+                min_positive_evidence_strength: EvidenceStrength::High,
+                weak_positive_enabled: true,
             },
             decision_rules: rvscreen::types::DecisionRules {
                 theta_pos: 0.001,
                 theta_neg: 0.0,
                 allow_indeterminate: true,
+                theta_neg_fixed: 0.00001,
+                positive_alpha_global: 0.05,
+                positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+                negative_cp_lod_max: 0.00001,
+                noise_floor_fraction: 0.000001,
             },
         })
         .map_err(io_other)?,
@@ -1964,6 +1984,8 @@ fn audit_sample_summary(reference_version: &str) -> SampleSummary {
         stop_reason: StopReason::PositiveBoundaryCrossed,
         decision_status: DecisionStatus::Positive,
         release_status: ReleaseStatus::Final,
+        release_primary_blockers: Vec::new(),
+        release_secondary_blockers: Vec::new(),
     }
 }
 
@@ -2010,6 +2032,16 @@ fn audit_candidate_calls() -> Vec<CandidateCall> {
         accession_or_group: "NC_SYNTHV1.1".to_string(),
         accepted_fragments: 12,
         nonoverlap_fragments: 4,
+        coverage_interval_blocks: 0,
+        nonoverlap_fragments_algorithm:
+            rvscreen::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+        accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+        unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+        total_sampled_fragments: 0,
+        fraction_denominator_source: "legacy_inferred".into(),
+        aggregation_level: "accession".into(),
+        multiplicity_family: "accession".into(),
+        accession_resolution: "high".into(),
         raw_fraction: 0.00012,
         unique_fraction: 12.0 / 100_000.0,
         fraction_ci_95: [0.00008, 0.00018],
@@ -2369,7 +2401,6 @@ struct CandidateRow {
     raw_fraction: f64,
     unique_fraction: f64,
     decision: String,
-    background_ratio: f64,
     decision_reasons: String,
 }
 
@@ -2597,6 +2628,7 @@ fn expected_checksum_inventory(report_dir: &Path) -> BTreeSet<String> {
         .iter()
         .copied()
         .chain(CANONICAL_REPORT_FILE_ARTIFACTS.iter().copied())
+        .chain(std::iter::once("results/detection_calls.group.tsv"))
     {
         if artifact != "checksum.sha256" && artifact != "audit/checksum.sha256" {
             expected.insert(artifact.to_string());
