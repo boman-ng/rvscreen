@@ -22,6 +22,7 @@ pub const CANONICAL_SAMPLE_RUN_SUMMARY_JSON: &str = "summary/sample_run_summary.
 pub const CANONICAL_RESULT_OVERVIEW_JSON: &str = "summary/result_overview.json";
 pub const CANONICAL_VIRUS_SUMMARY_TSV: &str = "summary/virus_summary.tsv";
 pub const CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV: &str = "results/candidate_calls.accession.tsv";
+pub const CANONICAL_DETECTION_CALLS_GROUP_TSV: &str = "results/detection_calls.group.tsv";
 pub const CANONICAL_SAMPLING_ROUNDS_TSV: &str = "results/sampling_rounds.tsv";
 pub const CANONICAL_POSITIVE_CANDIDATE_COVERAGE_DIR: &str = "evidence/positive_candidate_coverage";
 pub const CANONICAL_RUN_MANIFEST_JSON: &str = "provenance/run_manifest.json";
@@ -98,6 +99,16 @@ pub const REPORT_ARTIFACT_CONTRACTS: &[ReportArtifactContract] = &[
         mandatory_status: MandatoryStatus::Mandatory,
         checksum_inclusion: ChecksumInclusion::Include,
         verifier_expectation: "TSV header and rows parse as accession candidate calls",
+        kind: ReportArtifactKind::File,
+    },
+    ReportArtifactContract {
+        key: "detection_calls_group",
+        canonical_path: CANONICAL_DETECTION_CALLS_GROUP_TSV,
+        legacy_alias_path: None,
+        source_type_or_helper: "group detection calls TSV writer",
+        mandatory_status: MandatoryStatus::Mandatory,
+        checksum_inclusion: ChecksumInclusion::Include,
+        verifier_expectation: "TSV header and rows parse as virus group detection calls",
         kind: ReportArtifactKind::File,
     },
     ReportArtifactContract {
@@ -341,6 +352,13 @@ mod tests {
                 "candidate_calls_accession",
                 CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV,
                 Some(CANDIDATE_CALLS_TSV),
+                ChecksumInclusion::Include,
+                ReportArtifactKind::File,
+            ),
+            (
+                "detection_calls_group",
+                CANONICAL_DETECTION_CALLS_GROUP_TSV,
+                None,
                 ChecksumInclusion::Include,
                 ReportArtifactKind::File,
             ),

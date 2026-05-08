@@ -2,9 +2,10 @@ use crate::error::{Result, RvScreenError};
 use crate::report::contract::{
     sampling_only_ci_label, sampling_only_ci_label_violation, ChecksumInclusion,
     ReportArtifactKind, CANDIDATE_CALLS_TSV, CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV,
-    CANONICAL_CHECKSUM_SHA256, CANONICAL_POSITIVE_CANDIDATE_COVERAGE_DIR,
-    CANONICAL_RELEASE_GATE_JSON, CANONICAL_RESULT_OVERVIEW_JSON, CANONICAL_RUN_MANIFEST_JSON,
-    CANONICAL_RUN_NDJSON, CANONICAL_SAMPLE_RUN_SUMMARY_JSON, CANONICAL_SAMPLING_ROUNDS_TSV,
+    CANONICAL_CHECKSUM_SHA256, CANONICAL_DETECTION_CALLS_GROUP_TSV,
+    CANONICAL_POSITIVE_CANDIDATE_COVERAGE_DIR, CANONICAL_RELEASE_GATE_JSON,
+    CANONICAL_RESULT_OVERVIEW_JSON, CANONICAL_RUN_MANIFEST_JSON, CANONICAL_RUN_NDJSON,
+    CANONICAL_SAMPLE_RUN_SUMMARY_JSON, CANONICAL_SAMPLING_ROUNDS_TSV,
     CANONICAL_SCHEMA_VERSIONS_JSON, CANONICAL_VIRUS_SUMMARY_TSV, CHECKSUM_SHA256, COVERAGE_DIR,
     COVERAGE_HEADER, LOGS_DIR, REPORT_ARTIFACT_CONTRACTS, ROUNDS_TSV, RUN_LOG, RUN_MANIFEST_JSON,
     SAMPLE_SUMMARY_JSON,
@@ -23,19 +24,32 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) const CANDIDATE_CALLS_HEADER: [&str; 15] = [
+// IMPORTANT: this constant, the inline `CandidateCallRow` struct in
+// `write_candidate_calls_tsv`, and the `CandidateCallTsvRow` deserialiser in
+// `src/audit/mod.rs` must all stay aligned. The unit test
+// `candidate_calls_header_matches_constant` (further down in this file)
+// enforces order at runtime against the serialised output.
+pub(crate) const CANDIDATE_CALLS_HEADER: [&str; 23] = [
     "virus_name",
     "taxid",
     "accession_or_group",
     "accepted_fragments",
     "nonoverlap_fragments",
+    "coverage_interval_blocks",
+    "nonoverlap_fragments_algorithm",
     "raw_fraction",
     "unique_fraction",
+    "accepted_fraction_label",
+    "unique_fraction_label",
     "fraction_ci_95",
     "clopper_pearson_upper",
+    "total_sampled_fragments",
+    "fraction_denominator_source",
     "breadth",
     "ambiguous_fragments",
-    "background_ratio",
+    "aggregation_level",
+    "multiplicity_family",
+    "accession_resolution",
     "decision",
     "decision_reasons",
     "evidence_strength",
@@ -52,11 +66,12 @@ impl ReportWriter {
         output_dir: impl AsRef<Path>,
         summary: &SampleSummary,
         candidates: &[CandidateCall],
+        detection_calls: &[CandidateCall],
         rounds: &[RoundRecord],
         manifest: &RunManifest,
     ) -> Result<()> {
         let output_dir = output_dir.as_ref();
-        validate_bundle_inputs(summary, candidates, rounds, manifest)?;
+        validate_bundle_inputs(summary, candidates, detection_calls, rounds, manifest)?;
 
         create_dir_all(output_dir)?;
         clean_managed_outputs(output_dir)?;
@@ -65,6 +80,7 @@ impl ReportWriter {
         create_dir_all(&output_dir.join(LOGS_DIR))?;
         create_parent_dir(&output_dir.join(CANONICAL_SAMPLE_RUN_SUMMARY_JSON))?;
         create_parent_dir(&output_dir.join(CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV))?;
+        create_parent_dir(&output_dir.join(CANONICAL_DETECTION_CALLS_GROUP_TSV))?;
         create_parent_dir(&output_dir.join(CANONICAL_RUN_MANIFEST_JSON))?;
         create_parent_dir(&output_dir.join(CANONICAL_CHECKSUM_SHA256))?;
         create_parent_dir(&output_dir.join(CANONICAL_SCHEMA_VERSIONS_JSON))?;
@@ -73,20 +89,24 @@ impl ReportWriter {
         write_json_pretty(&output_dir.join(SAMPLE_SUMMARY_JSON), summary)?;
         write_bytes(
             &output_dir.join(CANONICAL_SAMPLE_RUN_SUMMARY_JSON),
-            serialize_sample_run_summary_json(summary, candidates, rounds)?,
+            serialize_sample_run_summary_json(summary, candidates, detection_calls, rounds)?,
         )?;
         write_bytes(
             &output_dir.join(CANONICAL_RESULT_OVERVIEW_JSON),
-            serialize_result_overview_json(summary, candidates, manifest)?,
+            serialize_result_overview_json(summary, candidates, detection_calls, manifest)?,
         )?;
         write_bytes(
             &output_dir.join(CANONICAL_VIRUS_SUMMARY_TSV),
-            serialize_virus_summary_tsv(candidates)?,
+            serialize_virus_summary_tsv(candidates, detection_calls)?,
         )?;
         write_candidate_calls_tsv(&output_dir.join(CANDIDATE_CALLS_TSV), candidates)?;
         write_candidate_calls_tsv(
             &output_dir.join(CANONICAL_CANDIDATE_CALLS_ACCESSION_TSV),
             candidates,
+        )?;
+        write_candidate_calls_tsv(
+            &output_dir.join(CANONICAL_DETECTION_CALLS_GROUP_TSV),
+            detection_calls,
         )?;
         write_json_pretty(&output_dir.join(RUN_MANIFEST_JSON), manifest)?;
         write_json_pretty(&output_dir.join(CANONICAL_RUN_MANIFEST_JSON), manifest)?;
@@ -100,22 +120,25 @@ impl ReportWriter {
         )?;
         write_rounds_tsv(&output_dir.join(ROUNDS_TSV), rounds)?;
         write_rounds_tsv(&output_dir.join(CANONICAL_SAMPLING_ROUNDS_TSV), rounds)?;
-        write_coverage_files(&output_dir.join(COVERAGE_DIR), candidates)?;
+        write_coverage_files(&output_dir.join(COVERAGE_DIR), candidates, detection_calls)?;
         write_canonical_coverage_files(
             &output_dir.join(CANONICAL_POSITIVE_CANDIDATE_COVERAGE_DIR),
             candidates,
+            detection_calls,
         )?;
         write_run_log(
             &output_dir.join(LOGS_DIR).join(RUN_LOG),
             output_dir,
             summary,
             candidates,
+            detection_calls,
         )?;
         write_run_log(
             &output_dir.join(CANONICAL_RUN_NDJSON),
             output_dir,
             summary,
             candidates,
+            detection_calls,
         )?;
         let checksum_files = collect_report_bundle_files(output_dir)?;
         write_checksum_file(
@@ -136,6 +159,7 @@ impl ReportWriter {
 fn validate_bundle_inputs(
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
     rounds: &[RoundRecord],
     manifest: &RunManifest,
 ) -> Result<()> {
@@ -190,7 +214,7 @@ fn validate_bundle_inputs(
         ));
     }
 
-    for candidate in candidates {
+    for candidate in candidates.iter().chain(detection_calls.iter()) {
         if let Some(violation) = sampling_only_ci_label_violation(&candidate.decision_reasons) {
             return Err(RvScreenError::validation(
                 "report.candidate_calls.fraction_ci_95",
@@ -224,13 +248,21 @@ fn write_candidate_calls_tsv(path: &Path, candidates: &[CandidateCall]) -> Resul
         accession_or_group: &'a str,
         accepted_fragments: u64,
         nonoverlap_fragments: u64,
+        coverage_interval_blocks: u64,
+        nonoverlap_fragments_algorithm: &'a str,
         raw_fraction: f64,
         unique_fraction: f64,
+        accepted_fraction_label: &'a str,
+        unique_fraction_label: &'a str,
         fraction_ci_95: String,
         clopper_pearson_upper: f64,
+        total_sampled_fragments: u64,
+        fraction_denominator_source: &'a str,
         breadth: f64,
         ambiguous_fragments: u64,
-        background_ratio: f64,
+        aggregation_level: &'a str,
+        multiplicity_family: &'a str,
+        accession_resolution: &'a str,
         decision: String,
         decision_reasons: String,
         evidence_strength: String,
@@ -269,13 +301,21 @@ fn write_candidate_calls_tsv(path: &Path, candidates: &[CandidateCall]) -> Resul
             accession_or_group: &candidate.accession_or_group,
             accepted_fragments: candidate.accepted_fragments,
             nonoverlap_fragments: candidate.nonoverlap_fragments,
+            coverage_interval_blocks: candidate.coverage_interval_blocks,
+            nonoverlap_fragments_algorithm: &candidate.nonoverlap_fragments_algorithm,
             raw_fraction: candidate.raw_fraction,
             unique_fraction: candidate.unique_fraction,
+            accepted_fraction_label: &candidate.accepted_fraction_label,
+            unique_fraction_label: &candidate.unique_fraction_label,
             fraction_ci_95: json_string(&candidate.fraction_ci_95)?,
             clopper_pearson_upper: candidate.clopper_pearson_upper,
+            total_sampled_fragments: candidate.total_sampled_fragments,
+            fraction_denominator_source: &candidate.fraction_denominator_source,
             breadth: candidate.breadth,
             ambiguous_fragments: candidate.ambiguous_fragments,
-            background_ratio: candidate.background_ratio,
+            aggregation_level: &candidate.aggregation_level,
+            multiplicity_family: &candidate.multiplicity_family,
+            accession_resolution: &candidate.accession_resolution,
             decision: enum_label(&candidate.decision)?,
             decision_reasons: json_string(&candidate.decision_reasons)?,
             evidence_strength: enum_label(&candidate.evidence_strength)?,
@@ -349,11 +389,16 @@ fn write_rounds_tsv(path: &Path, rounds: &[RoundRecord]) -> Result<()> {
         .map_err(|error| RvScreenError::io(path, error))
 }
 
-fn write_coverage_files(coverage_dir: &Path, candidates: &[CandidateCall]) -> Result<()> {
+fn write_coverage_files(
+    coverage_dir: &Path,
+    candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
+) -> Result<()> {
     let mut seen_paths = BTreeSet::new();
 
     for candidate in candidates
         .iter()
+        .chain(detection_calls.iter())
         .filter(|candidate| candidate.decision == DecisionStatus::Positive)
     {
         let file_name = format!(
@@ -378,11 +423,16 @@ fn write_coverage_files(coverage_dir: &Path, candidates: &[CandidateCall]) -> Re
     Ok(())
 }
 
-fn write_canonical_coverage_files(coverage_dir: &Path, candidates: &[CandidateCall]) -> Result<()> {
+fn write_canonical_coverage_files(
+    coverage_dir: &Path,
+    candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
+) -> Result<()> {
     let mut seen_paths = BTreeSet::new();
 
     for candidate in candidates
         .iter()
+        .chain(detection_calls.iter())
         .filter(|candidate| candidate.decision == DecisionStatus::Positive)
     {
         let file_name = format!(
@@ -412,7 +462,7 @@ fn canonical_coverage_prefix(candidate: &CandidateCall) -> &'static str {
     if candidate
         .decision_reasons
         .iter()
-        .any(|reason| reason == "aggregation_level=virus_group")
+        .any(|reason| reason == "aggregation_level=group")
     {
         "group"
     } else {
@@ -425,9 +475,11 @@ fn write_run_log(
     output_dir: &Path,
     summary: &SampleSummary,
     candidates: &[CandidateCall],
+    detection_calls: &[CandidateCall],
 ) -> Result<()> {
     let positive_candidates = candidates
         .iter()
+        .chain(detection_calls.iter())
         .filter(|candidate| candidate.decision == DecisionStatus::Positive)
         .map(|candidate| candidate.accession_or_group.as_str())
         .collect::<Vec<_>>();
@@ -474,7 +526,7 @@ fn schema_versions() -> impl Serialize {
         .collect::<BTreeMap<_, _>>();
 
     json!({
-        "report_bundle_schema": "rvscreen.report_bundle.v2",
+        "report_bundle_schema": "rvscreen.report_bundle.v4",
         "canonical_outputs": canonical_outputs,
         "legacy_outputs": legacy_outputs,
     })
@@ -485,6 +537,9 @@ fn release_gate(summary: &SampleSummary, manifest: &RunManifest) -> Result<impl 
         "schema_version": "rvscreen.release_gate.v1",
         "sample_id": summary.sample_id,
         "release_status": enum_label(&summary.release_status)?,
+        "status": enum_label(&summary.release_status)?,
+        "primary_blockers": summary.release_primary_blockers,
+        "secondary_blockers": summary.release_secondary_blockers,
         "decision_status": enum_label(&summary.decision_status)?,
         "stop_reason": enum_label(&summary.stop_reason)?,
         "rounds_run": summary.rounds_run,
@@ -834,7 +889,7 @@ mod tests {
         let candidates = candidate_fixtures();
         let rounds = round_fixtures();
 
-        ReportWriter::write(&output_dir, &summary, &candidates, &rounds, &manifest)
+        ReportWriter::write(&output_dir, &summary, &candidates, &[], &rounds, &manifest)
             .expect("report bundle should be written");
 
         let files = collect_relative_paths(&output_dir);
@@ -857,6 +912,7 @@ mod tests {
                 "provenance/run_manifest.json".to_string(),
                 "rounds.tsv".to_string(),
                 "results/candidate_calls.accession.tsv".to_string(),
+                "results/detection_calls.group.tsv".to_string(),
                 "results/sampling_rounds.tsv".to_string(),
                 "summary/result_overview.json".to_string(),
                 "summary/sample_run_summary.json".to_string(),
@@ -894,7 +950,7 @@ mod tests {
         .expect("result_overview.json should parse");
         assert_eq!(
             result_overview["schema_version"],
-            "rvscreen.result_overview.v1"
+            "rvscreen.result_overview.v2"
         );
         assert_eq!(result_overview["sample"]["sample_id"], summary.sample_id);
 
@@ -908,30 +964,7 @@ mod tests {
                 .expect("virus_summary.tsv should have headers")
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![
-                "rank",
-                "entity_id",
-                "entity_name",
-                "entity_type",
-                "taxid",
-                "aggregation_level",
-                "decision",
-                "evidence_strength",
-                "accepted_fragments",
-                "nonoverlap_fragments",
-                "ambiguous_fragments",
-                "raw_fraction",
-                "unique_fraction",
-                "fraction_ci_95_low",
-                "fraction_ci_95_high",
-                "clopper_pearson_upper",
-                "breadth",
-                "background_ratio",
-                "top_accession",
-                "top_accession_name",
-                "supporting_accession_count",
-                "decision_reasons",
-            ]
+            crate::report::summary::VIRUS_SUMMARY_HEADER
         );
         assert_eq!(
             virus_summary_reader
@@ -968,7 +1001,7 @@ mod tests {
         .expect("schema_versions.json should parse");
         assert_eq!(
             schema_versions["report_bundle_schema"],
-            "rvscreen.report_bundle.v2"
+            "rvscreen.report_bundle.v4"
         );
         for contract in REPORT_ARTIFACT_CONTRACTS {
             assert_eq!(
@@ -1026,26 +1059,7 @@ mod tests {
             .headers()
             .expect("candidate_calls.tsv should have headers")
             .clone();
-        assert_eq!(
-            headers.iter().collect::<Vec<_>>(),
-            vec![
-                "virus_name",
-                "taxid",
-                "accession_or_group",
-                "accepted_fragments",
-                "nonoverlap_fragments",
-                "raw_fraction",
-                "unique_fraction",
-                "fraction_ci_95",
-                "clopper_pearson_upper",
-                "breadth",
-                "ambiguous_fragments",
-                "background_ratio",
-                "decision",
-                "decision_reasons",
-                "evidence_strength",
-            ]
-        );
+        assert_eq!(headers.iter().collect::<Vec<_>>(), CANDIDATE_CALLS_HEADER);
 
         let candidate_records = candidate_reader
             .records()
@@ -1059,7 +1073,7 @@ mod tests {
             .expect("positive candidate should be present");
         let decision_reasons: Vec<String> = serde_json::from_str(
             positive_record
-                .get(13)
+                .get(21)
                 .expect("decision_reasons column should exist"),
         )
         .expect("decision_reasons should stay JSON encoded");
@@ -1069,7 +1083,7 @@ mod tests {
 
         let fraction_ci_95: [f64; 2] = serde_json::from_str(
             positive_record
-                .get(7)
+                .get(11)
                 .expect("fraction_ci_95 column should exist"),
         )
         .expect("fraction_ci_95 should stay JSON encoded");
@@ -1081,12 +1095,12 @@ mod tests {
             .parse::<u64>()
             .expect("accepted_fragments should parse");
         let raw_fraction = positive_record
-            .get(5)
+            .get(7)
             .expect("raw_fraction column should exist")
             .parse::<f64>()
             .expect("raw_fraction should parse");
         let unique_fraction = positive_record
-            .get(6)
+            .get(8)
             .expect("unique_fraction column should exist")
             .parse::<f64>()
             .expect("unique_fraction should parse");
@@ -1208,7 +1222,7 @@ mod tests {
         let candidates = Vec::new();
         let rounds = Vec::new();
 
-        ReportWriter::write(&output_dir, &summary, &candidates, &rounds, &manifest)
+        ReportWriter::write(&output_dir, &summary, &candidates, &[], &rounds, &manifest)
             .expect("no-detection report bundle should be written");
 
         let files = collect_relative_paths(&output_dir);
@@ -1236,7 +1250,7 @@ mod tests {
         )
         .expect("result_overview.json should parse");
         assert_eq!(
-            result_overview["top_results"].as_array().map(Vec::len),
+            result_overview["top_detections"].as_array().map(Vec::len),
             Some(0)
         );
 
@@ -1307,6 +1321,7 @@ mod tests {
             &output_dir,
             &summary,
             &candidates,
+            &[],
             &round_fixtures(),
             &manifest,
         )
@@ -1344,8 +1359,8 @@ mod tests {
             .iter()
             .find(|row| row.get(1) == Some("ebv"))
             .expect("accession summary row should exist");
-        assert_eq!(ebv_summary.get(18), Some("ebv"));
-        assert_eq!(ebv_summary.get(20), Some("1"));
+        assert_eq!(ebv_summary.get(24), Some("ebv"));
+        assert_eq!(ebv_summary.get(26), Some("1"));
         assert!(output_dir
             .join(COVERAGE_DIR)
             .join("ebv.coverage.tsv")
@@ -1359,10 +1374,10 @@ mod tests {
             .iter()
             .find(|row| row.get(1) == Some("herpes viridae"))
             .expect("group summary row should exist");
-        assert_eq!(group_summary.get(5), Some("virus_group"));
-        assert_eq!(group_summary.get(18), Some("NC_007605"));
-        assert_eq!(group_summary.get(19), Some("Human herpesvirus 4"));
-        assert_eq!(group_summary.get(20), Some("1"));
+        assert_eq!(group_summary.get(5), Some("group"));
+        assert_eq!(group_summary.get(24), Some("NC_007605"));
+        assert_eq!(group_summary.get(25), Some("Human herpesvirus 4"));
+        assert_eq!(group_summary.get(26), Some("1"));
         assert!(output_dir
             .join(COVERAGE_DIR)
             .join("herpes_viridae.coverage.tsv")
@@ -1377,9 +1392,9 @@ mod tests {
                 .expect("result_overview.json should be readable"),
         )
         .expect("result_overview.json should parse");
-        for top_result in result_overview["top_results"]
+        for top_result in result_overview["top_detections"]
             .as_array()
-            .expect("top_results should be an array")
+            .expect("top_detections should be an array")
         {
             let entity_id = top_result["entity_id"]
                 .as_str()
@@ -1405,6 +1420,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1421,7 +1437,7 @@ mod tests {
 
         let reasons: Vec<String> = serde_json::from_str(
             rows[0]
-                .get(13)
+                .get(21)
                 .expect("decision_reasons column should exist"),
         )
         .expect("decision_reasons should stay JSON encoded");
@@ -1449,6 +1465,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidates,
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1471,6 +1488,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1538,6 +1556,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1610,6 +1629,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1645,6 +1665,7 @@ mod tests {
             &output_dir,
             &sample_summary_fixture(),
             &candidate_fixtures(),
+            &[],
             &round_fixtures(),
             &run_manifest_fixture(),
         )
@@ -1801,6 +1822,8 @@ mod tests {
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
             release_status: ReleaseStatus::Provisional,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -1818,6 +1841,8 @@ mod tests {
             stop_reason: StopReason::NegativeBoundaryConfirmed,
             decision_status: DecisionStatus::Negative,
             release_status: ReleaseStatus::Provisional,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -1867,6 +1892,16 @@ mod tests {
                 accession_or_group: "ebv".into(),
                 accepted_fragments: 27,
                 nonoverlap_fragments: 6,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 27.0 / 400_000.0,
                 unique_fraction: 27.0 / 400_000.0,
                 fraction_ci_95: [0.00005, 0.00011],
@@ -1888,6 +1923,16 @@ mod tests {
                 accession_or_group: "influenza-a".into(),
                 accepted_fragments: 1,
                 nonoverlap_fragments: 1,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 1.0 / 400_000.0,
                 unique_fraction: 1.0 / 400_000.0,
                 fraction_ci_95: [0.0, 0.00002],
@@ -1909,6 +1954,16 @@ mod tests {
                 accession_or_group: "herpes viridae".into(),
                 accepted_fragments: 14,
                 nonoverlap_fragments: 5,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 14.0 / 400_000.0,
                 unique_fraction: 14.0 / 400_000.0,
                 fraction_ci_95: [0.00003, 0.00008],
@@ -1919,7 +1974,7 @@ mod tests {
                 decision: DecisionStatus::Positive,
                 decision_reasons: vec![
                     format!("{FRACTION_CI_REASON_PREFIX}{SAMPLING_ONLY_CI_LABEL}"),
-                    "aggregation_level=virus_group".into(),
+                    "aggregation_level=group".into(),
                     "supporting_accession=NC_007605".into(),
                     "supporting_accession_name=Human herpesvirus 4".into(),
                 ],
