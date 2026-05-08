@@ -203,43 +203,36 @@ fn annotate_candidate(
         .filter(|reason| {
             reason != "background_ratio_pending_task_19"
                 && reason != "background_ratio_computed_from_negative_control"
-                && !reason.starts_with("background_ratio_unavailable_")
-                && !reason.starts_with("negative_control_")
+                && !reason.starts_with("background_ratio_")
+                && !reason.starts_with("background_negative_safe")
+                && !reason.starts_with("background_not_negative_safe")
+                && !reason.starts_with("negative_control_background_fraction")
         })
         .collect::<Vec<_>>();
 
+    // ADR 0001: the default decision path no longer consumes
+    // `background_ratio`. We still record the measured value (when a
+    // negative control is available) so that downstream auditors can
+    // inspect host-control evidence as metadata.
+    reasons.push("negative_control_policy=not_used_for_default_background_assessment".to_string());
     match negative_control {
         NegativeControlDecisionInput::Missing => {
             candidate.background_ratio = 0.0;
-            reasons.push("background_ratio_unavailable_missing_negative_control".to_string());
+            reasons.push("negative_control_status=missing_metadata_only".to_string());
         }
         NegativeControlDecisionInput::Failed(result) => {
             candidate.background_ratio = 0.0;
             reasons.push(format!("negative_control_id={}", result.control_id));
             reasons.push(format!("negative_control_status={}", result.control_status));
-            reasons.push("background_ratio_unavailable_negative_control_not_pass".to_string());
         }
         NegativeControlDecisionInput::Passed { result, comparator } => {
             candidate.background_ratio = comparator.compute_background_ratio(&candidate);
             reasons.push(format!("negative_control_id={}", result.control_id));
-            reasons.push("negative_control_status=pass".to_string());
-
-            match comparator.background_fraction(&candidate.accession_or_group) {
-                Some(control_background_fraction) if control_background_fraction > 0.0 => {
-                    reasons.push(format!(
-                        "negative_control_background_fraction={control_background_fraction:.12e}"
-                    ));
-                    reasons.push("background_ratio_computed_from_negative_control".to_string());
-                }
-                Some(_) => {
-                    reasons.push("negative_control_background_fraction_zero".to_string());
-                    reasons.push("background_ratio_computed_from_negative_control".to_string());
-                }
-                None => {
-                    reasons.push("negative_control_background_fraction_absent".to_string());
-                    reasons.push("background_ratio_computed_from_negative_control".to_string());
-                }
-            }
+            reasons.push("negative_control_status=pass_metadata_only".to_string());
+            reasons.push(format!(
+                "background_ratio_metadata_only={:.6}",
+                candidate.background_ratio
+            ));
         }
     }
 
@@ -300,14 +293,16 @@ mod tests {
             },
         );
 
-        assert_eq!(compared[0].background_ratio, 1.25);
+        // candidate.unique_fraction (1e-4) / control.unique_fraction (8e-5) = 1.25
+        assert!((compared[0].background_ratio - 1.25).abs() < 1e-9);
 
         let evaluated = engine.evaluate_candidates(&compared);
-        assert_eq!(evaluated[0].decision, DecisionStatus::Indeterminate);
+        assert_eq!(evaluated[0].decision, DecisionStatus::Positive);
         assert!(evaluated[0]
             .decision_reasons
             .iter()
-            .any(|reason| reason == "background_ratio_below_positive_threshold"));
+            .any(|reason| reason
+                == "negative_control_policy=not_used_for_default_background_assessment"));
     }
 
     #[test]
@@ -334,6 +329,7 @@ mod tests {
             },
         );
 
+        // candidate.unique_fraction (1e-3) / control.unique_fraction (1e-6) = 1000.0
         assert!((compared[0].background_ratio - 1000.0).abs() < 1e-9);
 
         let evaluated = engine.evaluate_candidates(&compared);
@@ -341,7 +337,8 @@ mod tests {
         assert!(evaluated[0]
             .decision_reasons
             .iter()
-            .any(|reason| reason == "background_ratio_meets_minimum"));
+            .any(|reason| reason
+                == "negative_control_policy=not_used_for_default_background_assessment"));
     }
 
     #[test]
@@ -362,11 +359,14 @@ mod tests {
             },
         );
 
+        // candidate not in the control table -> background_fraction is None
+        // and unique_fraction > 0 -> ratio is INFINITY (metadata-only).
         assert!(compared[0].background_ratio.is_infinite());
         assert!(compared[0]
             .decision_reasons
             .iter()
-            .any(|reason| reason == "negative_control_background_fraction_absent"));
+            .any(|reason| reason
+                == "negative_control_policy=not_used_for_default_background_assessment"));
     }
 
     #[test]
@@ -390,7 +390,8 @@ mod tests {
             },
         );
 
-        assert!((compared[0].background_ratio - 2.0).abs() < 1e-12);
+        // candidate.unique_fraction (0.10) / control.unique_fraction (0.05) = 2.0
+        assert!((compared[0].background_ratio - 2.0).abs() < 1e-9);
     }
 
     fn decision_engine() -> DecisionEngine {
@@ -399,11 +400,20 @@ mod tests {
                 theta_pos: 0.00005,
                 theta_neg: 0.000005,
                 allow_indeterminate: true,
+                theta_neg_fixed: 0.00001,
+                positive_alpha_global: 0.05,
+                positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+                negative_cp_lod_max: 0.00001,
+                noise_floor_fraction: 0.000001,
             },
             &CandidateRules {
                 min_nonoverlap_fragments: 3,
                 min_breadth: 0.001,
                 max_background_ratio: 1.5,
+                theta_pos_absolute: 3,
+                max_ambiguous_fraction_for_positive: 0.20,
+                min_positive_evidence_strength: EvidenceStrength::High,
+                weak_positive_enabled: true,
             },
         )
     }
@@ -416,6 +426,16 @@ mod tests {
                 accession_or_group: "ACC-A".to_string(),
                 accepted_fragments: 4,
                 nonoverlap_fragments: 4,
+                coverage_interval_blocks: 0,
+                nonoverlap_fragments_algorithm:
+                    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+                accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+                unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+                total_sampled_fragments: 0,
+                fraction_denominator_source: "legacy_inferred".into(),
+                aggregation_level: "accession".into(),
+                multiplicity_family: "accession".into(),
+                accession_resolution: "high".into(),
                 raw_fraction: 0.0,
                 unique_fraction: 0.0,
                 fraction_ci_95: [0.0, 0.0],
@@ -425,7 +445,7 @@ mod tests {
                 background_ratio: 0.0,
                 decision: DecisionStatus::Indeterminate,
                 decision_reasons: vec!["background_ratio_pending_task_19".to_string()],
-                evidence_strength: EvidenceStrength::Low,
+                evidence_strength: EvidenceStrength::High,
             },
         }
     }
@@ -441,6 +461,12 @@ mod tests {
 
         fn with_unique_fraction(mut self, unique_fraction: f64) -> Self {
             self.inner.unique_fraction = unique_fraction;
+            if unique_fraction > 0.0 && unique_fraction.is_finite() {
+                self.inner.total_sampled_fragments =
+                    ((self.inner.accepted_fragments as f64 / unique_fraction).round() as u64)
+                        .max(self.inner.accepted_fragments);
+                self.inner.fraction_denominator_source = "sampled_fragments".to_string();
+            }
             self
         }
 

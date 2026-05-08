@@ -119,6 +119,14 @@ pub struct CandidateRules {
     pub min_nonoverlap_fragments: u64,
     pub min_breadth: f64,
     pub max_background_ratio: f64,
+    #[serde(default = "default_theta_pos_absolute")]
+    pub theta_pos_absolute: u64,
+    #[serde(default = "default_max_ambiguous_fraction_for_positive")]
+    pub max_ambiguous_fraction_for_positive: f64,
+    #[serde(default = "default_min_positive_evidence_strength")]
+    pub min_positive_evidence_strength: EvidenceStrength,
+    #[serde(default = "default_weak_positive_enabled")]
+    pub weak_positive_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -126,12 +134,23 @@ pub struct DecisionRules {
     pub theta_pos: f64,
     pub theta_neg: f64,
     pub allow_indeterminate: bool,
+    #[serde(default = "default_theta_neg_fixed")]
+    pub theta_neg_fixed: f64,
+    #[serde(default = "default_positive_alpha_global")]
+    pub positive_alpha_global: f64,
+    #[serde(default = "default_positive_statistic_method")]
+    pub positive_statistic_method: String,
+    #[serde(default = "default_negative_cp_lod_max")]
+    pub negative_cp_lod_max: f64,
+    #[serde(default = "default_noise_floor_fraction")]
+    pub noise_floor_fraction: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionStatus {
     Positive,
+    WeakPositive,
     Negative,
     Indeterminate,
 }
@@ -164,7 +183,9 @@ pub enum FragmentClass {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceStrength {
+    Insufficient,
     Low,
+    Moderate,
     Medium,
     High,
 }
@@ -175,6 +196,70 @@ pub enum StopReason {
     PositiveBoundaryCrossed,
     NegativeBoundaryConfirmed,
     MaxRoundsReached,
+}
+
+fn default_theta_pos_absolute() -> u64 {
+    1
+}
+
+fn default_max_ambiguous_fraction_for_positive() -> f64 {
+    0.20
+}
+
+fn default_min_positive_evidence_strength() -> EvidenceStrength {
+    EvidenceStrength::Moderate
+}
+
+fn default_weak_positive_enabled() -> bool {
+    true
+}
+
+fn default_theta_neg_fixed() -> f64 {
+    0.00001
+}
+
+fn default_positive_alpha_global() -> f64 {
+    0.05
+}
+
+fn default_positive_statistic_method() -> String {
+    "exact_binomial_survival_bonferroni".to_string()
+}
+
+fn default_negative_cp_lod_max() -> f64 {
+    0.00001
+}
+
+fn default_noise_floor_fraction() -> f64 {
+    0.000001
+}
+
+fn default_nonoverlap_fragments_algorithm() -> String {
+    crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string()
+}
+
+fn default_accepted_fraction_label() -> String {
+    "accepted_fragments_per_sampled_fragment".to_string()
+}
+
+fn default_unique_fraction_label() -> String {
+    "legacy_alias_not_molecule_unique".to_string()
+}
+
+fn default_fraction_denominator_source() -> String {
+    "legacy_inferred".to_string()
+}
+
+fn default_aggregation_level_label() -> String {
+    "accession".to_string()
+}
+
+fn default_multiplicity_family_label() -> String {
+    "accession".to_string()
+}
+
+fn default_accession_resolution_label() -> String {
+    "high".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -191,6 +276,10 @@ pub struct SampleSummary {
     pub stop_reason: StopReason,
     pub decision_status: DecisionStatus,
     pub release_status: ReleaseStatus,
+    #[serde(default)]
+    pub release_primary_blockers: Vec<String>,
+    #[serde(default)]
+    pub release_secondary_blockers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -200,13 +289,32 @@ pub struct CandidateCall {
     pub accession_or_group: String,
     pub accepted_fragments: u64,
     pub nonoverlap_fragments: u64,
+    #[serde(default)]
+    pub coverage_interval_blocks: u64,
+    #[serde(default = "default_nonoverlap_fragments_algorithm")]
+    pub nonoverlap_fragments_algorithm: String,
     pub raw_fraction: f64,
     pub unique_fraction: f64,
+    #[serde(default = "default_accepted_fraction_label")]
+    pub accepted_fraction_label: String,
+    #[serde(default = "default_unique_fraction_label")]
+    pub unique_fraction_label: String,
     pub fraction_ci_95: [f64; 2],
     pub clopper_pearson_upper: f64,
+    #[serde(default)]
+    pub total_sampled_fragments: u64,
+    #[serde(default = "default_fraction_denominator_source")]
+    pub fraction_denominator_source: String,
     pub breadth: f64,
     pub ambiguous_fragments: u64,
+    #[serde(default)]
     pub background_ratio: f64,
+    #[serde(default = "default_aggregation_level_label")]
+    pub aggregation_level: String,
+    #[serde(default = "default_multiplicity_family_label")]
+    pub multiplicity_family: String,
+    #[serde(default = "default_accession_resolution_label")]
+    pub accession_resolution: String,
     pub decision: DecisionStatus,
     pub decision_reasons: Vec<String>,
     pub evidence_strength: EvidenceStrength,
@@ -459,9 +567,11 @@ allow_indeterminate = true
                 "stop_reason",
                 "decision_status",
                 "release_status",
+                "release_primary_blockers",
+                "release_secondary_blockers",
             ],
         );
-        assert_eq!(object.len(), 12);
+        assert_eq!(object.len(), 14);
 
         let roundtrip: SampleSummary =
             serde_json::from_value(json).expect("sample summary should deserialize");
@@ -484,19 +594,28 @@ allow_indeterminate = true
                 "accession_or_group",
                 "accepted_fragments",
                 "nonoverlap_fragments",
+                "coverage_interval_blocks",
+                "nonoverlap_fragments_algorithm",
                 "raw_fraction",
                 "unique_fraction",
+                "accepted_fraction_label",
+                "unique_fraction_label",
                 "fraction_ci_95",
                 "clopper_pearson_upper",
+                "total_sampled_fragments",
+                "fraction_denominator_source",
                 "breadth",
                 "ambiguous_fragments",
                 "background_ratio",
+                "aggregation_level",
+                "multiplicity_family",
+                "accession_resolution",
                 "decision",
                 "decision_reasons",
                 "evidence_strength",
             ],
         );
-        assert_eq!(object.len(), 15);
+        assert_eq!(object.len(), 24);
 
         let roundtrip: CandidateCall =
             serde_json::from_value(json).expect("candidate call should deserialize");
@@ -647,6 +766,8 @@ allow_indeterminate = true
             stop_reason: StopReason::PositiveBoundaryCrossed,
             decision_status: DecisionStatus::Positive,
             release_status: ReleaseStatus::Final,
+            release_primary_blockers: Vec::new(),
+            release_secondary_blockers: Vec::new(),
         }
     }
 
@@ -657,6 +778,16 @@ allow_indeterminate = true
             accession_or_group: "ebv".into(),
             accepted_fragments: 27,
             nonoverlap_fragments: 6,
+            coverage_interval_blocks: 0,
+            nonoverlap_fragments_algorithm:
+                crate::aggregate::interval::NONOVERLAP_FRAGMENTS_ALGORITHM.to_string(),
+            accepted_fraction_label: "accepted_fragments_per_sampled_fragment".into(),
+            unique_fraction_label: "legacy_alias_not_molecule_unique".into(),
+            total_sampled_fragments: 0,
+            fraction_denominator_source: "legacy_inferred".into(),
+            aggregation_level: "accession".into(),
+            multiplicity_family: "accession".into(),
+            accession_resolution: "high".into(),
             raw_fraction: 27.0 / 400_000.0,
             unique_fraction: 27.0 / 400_000.0,
             fraction_ci_95: [0.00005, 0.00011],

@@ -3,7 +3,8 @@ use crate::cli::ScreenMode;
 use crate::decision::NegativeControlDecisionInput;
 use crate::error::{Result, RvScreenError};
 use crate::types::{
-    CandidateRules, DecisionRules, FragmentRules, ProfileToml, ReleaseStatus, SamplingConfig,
+    CandidateRules, DecisionRules, EvidenceStrength, FragmentRules, ProfileToml, ReleaseStatus,
+    SamplingConfig,
 };
 use std::fs;
 use std::path::Path;
@@ -19,25 +20,67 @@ pub struct ReleaseContext<'a> {
     pub benchmark_gates: Option<&'a BenchmarkGates>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReleaseGateDecision {
+    pub status: ReleaseStatus,
+    #[serde(default)]
+    pub primary_blockers: Vec<String>,
+    #[serde(default)]
+    pub secondary_blockers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReleaseGate;
 
 impl ReleaseGate {
     pub fn evaluate(context: &ReleaseContext) -> ReleaseStatus {
-        if negative_control_gate_blocked(context)
-            || profile_gate_blocked(context)
-            || benchmark_gate_blocked(context)
-        {
-            return ReleaseStatus::Blocked;
+        Self::evaluate_decision(context).status
+    }
+
+    pub fn evaluate_decision(context: &ReleaseContext) -> ReleaseGateDecision {
+        let mut primary_blockers = Vec::new();
+        let mut secondary_blockers = Vec::new();
+
+        if profile_gate_blocked(context) {
+            primary_blockers.push("benchmark_failed_profile".to_string());
+        }
+        if negative_control_gate_blocked(context) {
+            primary_blockers.push("failed_negative_control".to_string());
+        }
+        match context.benchmark_gates {
+            None => primary_blockers.push("missing_calibration_release_gate".to_string()),
+            Some(gates) => {
+                if gate_failed(&gates.backend_gate.status) {
+                    primary_blockers.push("backend_gate_failed".to_string());
+                }
+                if gate_failed(&gates.reference_gate.status) {
+                    primary_blockers.push("reference_gate_failed".to_string());
+                }
+                if gate_failed(&gates.specificity_gate.status) {
+                    primary_blockers.push("specificity_gate_failed".to_string());
+                }
+                if gate_failed(&gates.sensitivity_gate.status) {
+                    primary_blockers.push("sensitivity_gate_failed".to_string());
+                }
+            }
+        }
+        if context.sampling_mode != ScreenMode::Representative {
+            secondary_blockers.push("non_representative_sampling_mode".to_string());
         }
 
-        if !has_qualified_negative_control(context)
-            || context.sampling_mode != ScreenMode::Representative
-        {
-            return ReleaseStatus::Provisional;
-        }
+        let status = if !primary_blockers.is_empty() {
+            ReleaseStatus::Blocked
+        } else if !secondary_blockers.is_empty() {
+            ReleaseStatus::Provisional
+        } else {
+            ReleaseStatus::Final
+        };
 
-        ReleaseStatus::Final
+        ReleaseGateDecision {
+            status,
+            primary_blockers,
+            secondary_blockers,
+        }
     }
 }
 
@@ -48,10 +91,27 @@ pub fn expected_release_status(
     benchmark_gates: Option<&BenchmarkGates>,
     profile_status: &str,
 ) -> Result<ReleaseStatus> {
+    Ok(expected_release_gate_decision(
+        sampling_mode,
+        negative_control_required,
+        negative_control,
+        benchmark_gates,
+        profile_status,
+    )?
+    .status)
+}
+
+pub fn expected_release_gate_decision(
+    sampling_mode: &str,
+    negative_control_required: bool,
+    negative_control: &NegativeControlDecisionInput,
+    benchmark_gates: Option<&BenchmarkGates>,
+    profile_status: &str,
+) -> Result<ReleaseGateDecision> {
     let sampling_mode = parse_sampling_mode(sampling_mode)?;
     let calibration_profile =
         synthetic_profile(negative_control_required, profile_status, sampling_mode);
-    Ok(ReleaseGate::evaluate(&ReleaseContext {
+    Ok(ReleaseGate::evaluate_decision(&ReleaseContext {
         sampling_mode,
         negative_control,
         calibration_profile: &calibration_profile,
@@ -77,18 +137,9 @@ pub fn load_benchmark_gates(profile_dir: impl AsRef<Path>) -> Result<Option<Benc
     Ok(Some(gates))
 }
 
-fn has_qualified_negative_control(context: &ReleaseContext) -> bool {
-    matches!(
-        context.negative_control,
-        NegativeControlDecisionInput::Passed { .. }
-    )
-}
-
 fn negative_control_gate_blocked(context: &ReleaseContext) -> bool {
     match context.negative_control {
-        NegativeControlDecisionInput::Missing => {
-            context.calibration_profile.negative_control_required
-        }
+        NegativeControlDecisionInput::Missing => false,
         NegativeControlDecisionInput::Failed(_) => true,
         NegativeControlDecisionInput::Passed { .. } => false,
     }
@@ -100,17 +151,6 @@ fn profile_gate_blocked(context: &ReleaseContext) -> bool {
         .status
         .trim()
         .eq_ignore_ascii_case(FAILED_PROFILE_STATUS)
-}
-
-fn benchmark_gate_blocked(context: &ReleaseContext) -> bool {
-    let Some(gates) = context.benchmark_gates else {
-        return true;
-    };
-
-    gate_failed(&gates.backend_gate.status)
-        || gate_failed(&gates.reference_gate.status)
-        || gate_failed(&gates.specificity_gate.status)
-        || gate_failed(&gates.sensitivity_gate.status)
 }
 
 fn gate_failed(status: &GateStatus) -> bool {
@@ -163,11 +203,20 @@ fn synthetic_profile(
             min_nonoverlap_fragments: 1,
             min_breadth: 0.0,
             max_background_ratio: 0.0,
+            theta_pos_absolute: 1,
+            max_ambiguous_fraction_for_positive: 0.20,
+            min_positive_evidence_strength: EvidenceStrength::Moderate,
+            weak_positive_enabled: true,
         },
         decision_rules: DecisionRules {
             theta_pos: 0.0,
             theta_neg: 0.0,
             allow_indeterminate: true,
+            theta_neg_fixed: 0.00001,
+            positive_alpha_global: 0.05,
+            positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+            negative_cp_lod_max: 0.00001,
+            noise_floor_fraction: 0.000001,
         },
     }
 }
@@ -201,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_negative_control_when_required_is_blocked() {
+    fn missing_negative_control_even_when_profile_requires_is_metadata_only() {
         let benchmark_gates = benchmark_gates(
             GateStatus::Pass,
             GateStatus::Pass,
@@ -216,7 +265,7 @@ mod tests {
             benchmark_gates: Some(&benchmark_gates),
         });
 
-        assert_eq!(status, ReleaseStatus::Blocked);
+        assert_eq!(status, ReleaseStatus::Final);
     }
 
     #[test]
@@ -240,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_missing_negative_control_is_provisional() {
+    fn optional_missing_negative_control_with_passing_gates_is_final() {
         let benchmark_gates = benchmark_gates(
             GateStatus::Pass,
             GateStatus::Pass,
@@ -255,7 +304,7 @@ mod tests {
             benchmark_gates: Some(&benchmark_gates),
         });
 
-        assert_eq!(status, ReleaseStatus::Provisional);
+        assert_eq!(status, ReleaseStatus::Final);
     }
 
     #[test]
@@ -447,11 +496,20 @@ mod tests {
                 min_nonoverlap_fragments: 1,
                 min_breadth: 0.0,
                 max_background_ratio: 1.5,
+                theta_pos_absolute: 1,
+                max_ambiguous_fraction_for_positive: 0.20,
+                min_positive_evidence_strength: EvidenceStrength::Moderate,
+                weak_positive_enabled: true,
             },
             decision_rules: DecisionRules {
                 theta_pos: 0.01,
                 theta_neg: 0.0001,
                 allow_indeterminate: true,
+                theta_neg_fixed: 0.00001,
+                positive_alpha_global: 0.05,
+                positive_statistic_method: "exact_binomial_survival_bonferroni".to_string(),
+                negative_cp_lod_max: 0.00001,
+                noise_floor_fraction: 0.000001,
             },
         }
     }

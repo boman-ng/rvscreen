@@ -1,4 +1,4 @@
-use statrs::distribution::{Beta, ContinuousCDF};
+use statrs::distribution::{Beta, Binomial, ContinuousCDF, DiscreteCDF};
 
 pub const SAMPLING_ONLY_CI_LABEL: &str =
     "sampling-only CI: accepted-fragment sampling uncertainty only; not diagnostic confidence";
@@ -90,6 +90,36 @@ pub fn clopper_pearson_upper_95_one_sided(successes: u64, trials: u64) -> f64 {
     clamp_probability((lower + upper) / 2.0)
 }
 
+pub fn exact_binomial_survival(successes: u64, trials: u64, null_probability: f64) -> f64 {
+    if successes == 0 {
+        return 1.0;
+    }
+    if trials == 0 || successes > trials {
+        return 0.0;
+    }
+    let p = clamp_probability(null_probability);
+    if p == 0.0 {
+        return 0.0;
+    }
+    if p == 1.0 {
+        return 1.0;
+    }
+
+    let distribution = Binomial::new(p, trials).expect("validated binomial parameters");
+    (1.0 - distribution.cdf(successes - 1)).clamp(0.0, 1.0)
+}
+
+pub fn bonferroni_corrected_alpha(
+    alpha_global: f64,
+    candidate_family_size: u64,
+    planned_round_look_count: u64,
+) -> f64 {
+    let family = candidate_family_size
+        .max(1)
+        .saturating_mul(planned_round_look_count.max(1));
+    clamp_probability(alpha_global) / family as f64
+}
+
 fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -142,6 +172,19 @@ mod tests {
         let estimate = ProportionEstimate::from_counts(1, 10_000);
 
         assert!((estimate.clopper_pearson_upper - 4.742_976_591_654_568_5e-4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn exact_binomial_survival_detects_single_fragment_is_weak_evidence() {
+        let p_value = exact_binomial_survival(1, 20_000, 0.00001);
+        assert!(p_value > bonferroni_corrected_alpha(0.05, 44, 4));
+    }
+
+    #[test]
+    fn bonferroni_alpha_accounts_for_candidate_and_round_families() {
+        assert!(
+            (bonferroni_corrected_alpha(0.05, 44, 4) - 0.000_284_090_909_090_909_1).abs() < 1e-15
+        );
     }
 
     #[test]
