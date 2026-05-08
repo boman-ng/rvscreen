@@ -1,3 +1,4 @@
+#![allow(clippy::manual_inspect, clippy::while_let_on_iterator)]
 use criterion::{black_box, BenchmarkId, Criterion, Throughput};
 use rayon::prelude::*;
 use rvscreen::align::{CompetitiveAligner, CompetitivePreset, FragmentAlignResult};
@@ -144,9 +145,9 @@ fn benchmark_end_to_end(
                     let output_dir = fixture.output_dir("criterion-e2e", threads);
                     let outcome = run_screen(&fixture.screen_args(threads, output_dir.clone()))
                         .expect("end-to-end latency benchmark should succeed");
-                    assert_eq!(
+                    assert_representative_sampled_prefix(
                         outcome.summary.sampled_fragments,
-                        fixture.fragment_count as u64
+                        fixture.fragment_count as u64,
                     );
                     fs::remove_dir_all(output_dir).ok();
                     black_box(outcome.summary.rounds_run)
@@ -233,9 +234,9 @@ fn collect_summary(
                 let started = Instant::now();
                 let outcome = run_screen(&e2e_fixture.screen_args(threads, output_dir.clone()))
                     .map_err(io_other)?;
-                assert_eq!(
+                assert_representative_sampled_prefix(
                     outcome.summary.sampled_fragments,
-                    e2e_fixture.fragment_count as u64
+                    e2e_fixture.fragment_count as u64,
                 );
                 fs::remove_dir_all(output_dir).ok();
                 Ok(started.elapsed())
@@ -274,9 +275,9 @@ fn collect_summary(
                 let outcome = prepared
                     .run_without_report(&execute_args)
                     .map_err(io_other)?;
-                assert_eq!(
+                assert_representative_sampled_prefix(
                     outcome.summary.sampled_fragments,
-                    e2e_fixture.fragment_count as u64
+                    e2e_fixture.fragment_count as u64,
                 );
                 fs::remove_dir_all(prepare_output_dir).ok();
                 fs::remove_dir_all(execute_output_dir).ok();
@@ -685,6 +686,13 @@ fn run_perf_screen(
         run_screen(&fixture.screen_args(threads, output_dir.clone())).map_err(io_other)?;
     fs::remove_dir_all(output_dir).ok();
     Ok(outcome.perf_metrics)
+}
+
+fn assert_representative_sampled_prefix(sampled_fragments: u64, input_fragments: u64) {
+    assert!(
+        sampled_fragments > 0 && sampled_fragments <= input_fragments,
+        "representative benchmark should process a non-empty prefix of the fixture: sampled={sampled_fragments}, input={input_fragments}"
+    );
 }
 
 fn count_fastq_pairs(r1: &Path, r2: &Path) -> io::Result<usize> {

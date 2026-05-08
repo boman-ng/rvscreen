@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::testutil::generate_mini_reference;
 use rvscreen::reference::{build_reference_bundle, BuildReferenceBundleRequest};
 use rvscreen::sampling::DEFAULT_REPRESENTATIVE_ROUND_PROPORTIONS;
