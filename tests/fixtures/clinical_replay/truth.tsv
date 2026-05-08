@@ -1,0 +1,7 @@
+sample_id	truth
+single_fragment_5k	negative
+single_fragment_20k	negative
+low_evidence_signal	negative
+nonzero_low_noise_negative	negative
+unknown_background_signal	positive
+hpv18_like_stable_low_signal	positive
